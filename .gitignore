@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.cache/
+*.log
+.DS_Store
+.env
+.env.local
+coverage/
+*.tsbuildinfo
+
+# Build artifacts in test dirs
+packages/core/__tests__/**/*.js
+packages/core/__tests__/**/*.js.map
+packages/core/__tests__/**/*.d.ts
+packages/core/__tests__/**/*.d.ts.map
+
+# Large session binaries
+apps/web/public/sessions/**/*.mp4

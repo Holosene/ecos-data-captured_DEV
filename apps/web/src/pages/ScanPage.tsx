@@ -1,0 +1,1168 @@
+/**
+ * ECOS — Scan Page (V2 only)
+ *
+ * Workflow:
+ *   1. Importer — MP4 + GPX
+ *   2. Recadrer — visual drag crop tool
+ *   3. Configurer — mode, depth, sync, generate (processing happens here)
+ *   4. Visualiser — 3D volumetric viewer (step bar slides away)
+ */
+
+import React, { useCallback, useRef, useState, useEffect, useMemo } from 'react';
+import { GlassPanel, Button, FileDropZone, ProgressBar, Slider, StepIndicator, colors } from '@echos/ui';
+import {
+  parseGpx,
+  enrichTrackpoints,
+  estimateVolumeMemoryMB,
+  autoDetectCropRegion,
+  autoDetectDepthMax,
+} from '@echos/core';
+import type {
+  PreprocessingSettings,
+  BeamSettings,
+  VolumeGridSettings,
+  PipelineV2Progress,
+  CropRect,
+} from '@echos/core';
+import {
+  DEFAULT_PREPROCESSING,
+  DEFAULT_BEAM,
+  DEFAULT_GRID,
+} from '@echos/core';
+import { useAppState } from '../store/app-state.js';
+import { useTranslation } from '../i18n/index.js';
+import { VolumeViewer } from '../components/VolumeViewer.js';
+import { ViewerErrorBoundary } from '../components/ErrorBoundary.js';
+import {
+  getState as getPipelineState,
+  subscribe as subscribePipeline,
+  runPipeline as runStorePipeline,
+  abort as abortPipeline,
+  reset as resetPipeline,
+  publishToRepo,
+} from '../store/pipeline-store.js';
+
+type ScanPhase = 'import' | 'crop' | 'settings' | 'processing' | 'viewer';
+
+// Steps shown in the bar (no "Traitement")
+const PIPELINE_STEP_KEYS = [
+  { labelKey: 'v2.step.import', key: 'import' },
+  { labelKey: 'v2.step.crop', key: 'crop' },
+  { labelKey: 'v2.step.settings', key: 'settings' },
+  { labelKey: 'v2.step.viewer', key: 'viewer' },
+] as const;
+
+function phaseToStepIndex(phase: ScanPhase): number {
+  if (phase === 'processing') return 3; // Configurer is done, show checkmark; progress bar fills toward Visualiser
+  return PIPELINE_STEP_KEYS.findIndex((s) => s.key === phase);
+}
+
+// ─── Quality presets ─────────────────────────────────────────────────────────
+
+type QualityPreset = 'minimal' | 'medium' | 'complete';
+
+interface QualityConfig {
+  fps: number;
+  grid: VolumeGridSettings;
+  preprocessing: PreprocessingSettings;
+}
+
+const QUALITY_PRESETS: Record<QualityPreset, QualityConfig> = {
+  minimal: {
+    fps: 1,
+    grid: { resX: 48, resY: 48, resZ: 48 },
+    preprocessing: {
+      upscaleFactor: 1,
+      denoiseStrength: 0,
+      gamma: 0.9,
+      gaussianSigma: 0,
+      deblockStrength: 0,
+    },
+  },
+  medium: {
+    fps: 3,
+    grid: { resX: 80, resY: 80, resZ: 80 },
+    preprocessing: {
+      upscaleFactor: 1,
+      denoiseStrength: 0,
+      gamma: 0.9,
+      gaussianSigma: 0,
+      deblockStrength: 0,
+    },
+  },
+  complete: {
+    fps: 6,
+    grid: { resX: 128, resY: 128, resZ: 128 },
+    preprocessing: {
+      ...DEFAULT_PREPROCESSING,
+    },
+  },
+};
+
+// Exponential depth steps: fine resolution at shallow depths
+const DEPTH_STEPS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 25, 30, 35, 40, 50, 60, 80, 100];
+
+function depthToSliderIndex(depth: number): number {
+  let closest = 0;
+  let minDiff = Math.abs(DEPTH_STEPS[0] - depth);
+  for (let i = 1; i < DEPTH_STEPS.length; i++) {
+    const diff = Math.abs(DEPTH_STEPS[i] - depth);
+    if (diff < minDiff) { minDiff = diff; closest = i; }
+  }
+  return closest;
+}
+
+export function ScanPage() {
+  const { state, dispatch } = useAppState();
+  const { t, lang } = useTranslation();
+
+  const [phase, setPhase] = useState<ScanPhase>('import');
+  // All 3 modes generated simultaneously — no mode selection needed
+
+  // Settings — driven by quality preset
+  const [quality, setQuality] = useState<QualityPreset>('medium');
+  const activeConfig = QUALITY_PRESETS[quality];
+  const preprocessing = activeConfig.preprocessing;
+  const grid = activeConfig.grid;
+  const fpsExtraction = activeConfig.fps;
+  const [beam, setBeam] = useState<BeamSettings>({ ...DEFAULT_BEAM });
+  const [crop, setCrop] = useState<CropRect>({ x: 0, y: 0, width: 640, height: 480 });
+
+  // Auto-depth
+  const [autoDepth, setAutoDepth] = useState(false);
+  const [detectedDepth, setDetectedDepth] = useState<number | null>(null);
+
+  // Depth slider index (exponential)
+  const [depthSliderIdx, setDepthSliderIdx] = useState(() => depthToSliderIndex(DEFAULT_BEAM.depthMaxM));
+
+  // Crop tool state
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [frameReady, setFrameReady] = useState(false);
+  const [scale, setScale] = useState(1);
+  const frameBitmapRef = useRef<ImageBitmap | null>(null);
+  const draggingRef = useRef(false);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const cropRef = useRef(crop);
+  const scaleRef = useRef(scale);
+  const rafIdRef = useRef(0);
+  cropRef.current = crop;
+  scaleRef.current = scale;
+
+  // Pipeline store subscription — survives unmount/remount
+  const [progress, setProgress] = useState<PipelineV2Progress | null>(getPipelineState().progress);
+  const [volumeData, setVolumeData] = useState<Float32Array | null>(getPipelineState().result?.volumeData ?? null);
+  const [volumeDims, setVolumeDims] = useState<[number, number, number]>(getPipelineState().result?.volumeDims ?? [1, 1, 1]);
+  const [volumeExtent, setVolumeExtent] = useState<[number, number, number]>(getPipelineState().result?.volumeExtent ?? [1, 1, 1]);
+  const [instrumentFrames, setInstrumentFrames] = useState<Array<{
+    index: number; timeS: number; intensity: Float32Array; width: number; height: number;
+  }> | null>(getPipelineState().result?.instrumentFrames ?? null);
+  const [published, setPublished] = useState(getPipelineState().published);
+  const [publishError, setPublishError] = useState<string | null>(null);
+
+  // Step bar animation state
+  const [stepBarVisible, setStepBarVisible] = useState(true);
+  const [stepBarAnimating, setStepBarAnimating] = useState(false);
+  const [loadingTest, setLoadingTest] = useState(false);
+
+  // Restore phase from pipeline store on mount
+  useEffect(() => {
+    const ps = getPipelineState();
+    if (ps.status === 'ready' && ps.result) {
+      // Pipeline completed while we were away — restore viewer
+      setVolumeData(ps.result.volumeData);
+      setVolumeDims(ps.result.volumeDims);
+      setVolumeExtent(ps.result.volumeExtent);
+      setInstrumentFrames(ps.result.instrumentFrames);
+      setPublished(ps.published);
+      setPhase('viewer');
+      setTimeout(() => {
+        requestAnimationFrame(() => {
+          setStepBarAnimating(true);
+          setTimeout(() => setStepBarVisible(false), 700);
+        });
+      }, 300);
+    } else if (ps.status === 'extracting' || ps.status === 'projecting' || ps.status === 'saving') {
+      // Pipeline still running — show processing overlay
+      setPhase('processing');
+      setProgress(ps.progress);
+    }
+  }, []);
+
+  // Subscribe to pipeline store updates
+  useEffect(() => {
+    const unsub = subscribePipeline((ps) => {
+      setProgress(ps.progress);
+      setPublished(ps.published);
+
+      if (ps.status === 'ready' && ps.result) {
+        setVolumeData(ps.result.volumeData);
+        setVolumeDims(ps.result.volumeDims);
+        setVolumeExtent(ps.result.volumeExtent);
+        setInstrumentFrames(ps.result.instrumentFrames);
+
+        // Dispatch to AppState so session appears on map
+        dispatch({
+          type: 'SET_V2_VOLUME',
+          data: ps.result.volumeData,
+          dimensions: ps.result.volumeDims,
+          extent: ps.result.volumeExtent,
+        });
+        dispatch({
+          type: 'ADD_SESSION',
+          session: {
+            id: ps.result.sessionId,
+            name: ps.result.videoFileName.replace(/\.\w+$/, ''),
+            createdAt: new Date().toISOString(),
+            videoFileName: ps.result.videoFileName,
+            gpxFileName: ps.result.gpxFileName,
+            bounds: ps.result.bounds,
+            totalDistanceM: ps.result.totalDistanceM,
+            durationS: ps.result.durationS,
+            frameCount: ps.result.instrumentFrames.length,
+            gridDimensions: ps.result.volumeDims,
+            preprocessing: ps.result.preprocessing,
+            beam: ps.result.beam,
+          },
+          gpxTrack: ps.result.gpxPoints,
+        });
+
+        // Transition to viewer
+        setPhase('viewer');
+        setTimeout(() => {
+          requestAnimationFrame(() => {
+            setStepBarAnimating(true);
+            setTimeout(() => setStepBarVisible(false), 700);
+          });
+        }, 1200);
+      } else if (ps.status === 'error') {
+        setPhase('settings');
+      }
+    });
+    return unsub;
+  }, [dispatch]);
+
+  // Sync: distance-over-time chart
+  const enriched = useMemo(
+    () => (state.gpxTrack ? enrichTrackpoints(state.gpxTrack) : []),
+    [state.gpxTrack],
+  );
+  const maxDist = enriched.length > 0 ? enriched[enriched.length - 1].cumulativeDistanceM : 0;
+  const chartWidth = 600;
+  const chartHeight = 120;
+  const chartPoints = useMemo(() => {
+    if (enriched.length === 0) return '';
+    const maxT = enriched[enriched.length - 1].elapsedS || 1;
+    return enriched
+      .map((pt: { elapsedS: number; cumulativeDistanceM: number }) => {
+        const x = (pt.elapsedS / maxT) * chartWidth;
+        const y = chartHeight - (pt.cumulativeDistanceM / (maxDist || 1)) * chartHeight;
+        return `${x},${y}`;
+      })
+      .join(' ');
+  }, [enriched, maxDist]);
+
+  // ─── File handlers ────────────────────────────────────────────────────
+
+  const handleVideoFile = useCallback(
+    async (files: File[]) => {
+      const file = files[0];
+      if (!file) return;
+      try {
+        const url = URL.createObjectURL(file);
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+        await new Promise<void>((resolve, reject) => {
+          video.onloadedmetadata = () => resolve();
+          video.onerror = () => reject(new Error('Failed to read video metadata'));
+          video.src = url;
+        });
+        dispatch({
+          type: 'SET_VIDEO',
+          file,
+          durationS: video.duration,
+          width: video.videoWidth,
+          height: video.videoHeight,
+        });
+        setCrop({ x: 0, y: 0, width: video.videoWidth, height: video.videoHeight });
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        dispatch({ type: 'SET_ERROR', error: `Could not read video: ${(e as Error).message}` });
+      }
+    },
+    [dispatch],
+  );
+
+  const handleGpxFile = useCallback(
+    async (files: File[]) => {
+      const file = files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const track = parseGpx(text);
+        dispatch({ type: 'SET_GPX', file, track });
+      } catch (e) {
+        dispatch({ type: 'SET_ERROR', error: `Could not parse GPX: ${(e as Error).message}` });
+      }
+    },
+    [dispatch],
+  );
+
+  // Both Rendu A and Rendu B only require video; GPX is optional
+  const canConfigure = !!state.videoFile;
+  const noFilesYet = !state.videoFile && !state.gpxFile;
+
+  const handleLoadTest = useCallback(async () => {
+    setLoadingTest(true);
+    try {
+      const videoName = 'exemple_video_2026-02-28_at_00.05.10.mp4';
+      const gpxName = 'exemple_22_févr._2026_15_35_50.gpx';
+      const basePath = import.meta.env.BASE_URL ?? '/ecos-data-captured/';
+      const testVideoUrl = `${basePath}examples/${encodeURIComponent(videoName)}`;
+      const gpxUrl = `${basePath}examples/${encodeURIComponent(gpxName)}`;
+
+      // HEAD for video (no download), full fetch for GPX (6KB)
+      const [mp4Resp, gpxResp] = await Promise.all([
+        fetch(testVideoUrl, { method: 'HEAD' }),
+        fetch(gpxUrl),
+      ]);
+      const missing: string[] = [];
+      if (!mp4Resp.ok) missing.push(videoName);
+      if (!gpxResp.ok) missing.push(gpxName);
+      if (missing.length > 0) {
+        dispatch({ type: 'SET_ERROR', error: `Fichiers introuvables dans ${basePath}examples/ : ${missing.join(', ')}` });
+        return;
+      }
+
+      // Load video metadata directly from URL (no download)
+      const video = document.createElement('video');
+      video.preload = 'metadata';
+      await new Promise<void>((resolve, reject) => {
+        video.onloadedmetadata = () => resolve();
+        video.onerror = () => reject(new Error('Failed to read video metadata'));
+        video.src = testVideoUrl;
+      });
+      dispatch({
+        type: 'SET_VIDEO',
+        file: new File([], videoName, { type: 'video/mp4' }),
+        url: testVideoUrl,
+        durationS: video.duration,
+        width: video.videoWidth,
+        height: video.videoHeight,
+      });
+      setCrop({ x: 0, y: 0, width: video.videoWidth, height: video.videoHeight });
+
+      // GPX is tiny, process normally
+      const gpxBlob = await gpxResp.blob();
+      const gpxFile = new File([gpxBlob], gpxName, { type: 'application/gpx+xml' });
+      await handleGpxFile([gpxFile]);
+    } catch (e) {
+      dispatch({ type: 'SET_ERROR', error: `Erreur chargement test: ${(e as Error).message}` });
+    } finally {
+      setLoadingTest(false);
+    }
+  }, [dispatch, handleGpxFile]);
+
+  // ─── Crop tool: auto-detect + visual canvas ───────────────────────────
+
+  useEffect(() => {
+    if (phase !== 'crop' || !state.videoFile) return;
+    setFrameReady(false);
+
+    const isBlobUrl = !state.videoUrl;
+    const url = state.videoUrl ?? URL.createObjectURL(state.videoFile);
+    const video = document.createElement('video');
+    video.preload = 'auto';
+    video.muted = true;
+    video.crossOrigin = 'anonymous';
+    let disposed = false;
+
+    video.onloadeddata = () => {
+      video.currentTime = Math.min(video.duration / 3, 10);
+    };
+
+    video.onseeked = async () => {
+      if (disposed) return;
+      const canvas = canvasRef.current;
+      if (!canvas) { if (isBlobUrl) URL.revokeObjectURL(url); return; }
+
+      const container = containerRef.current;
+      const maxW = container ? container.clientWidth - 20 : 800;
+      const maxH = container ? container.clientHeight - 10 : 600;
+      const s = Math.min(1, maxW / video.videoWidth, maxH / video.videoHeight);
+      setScale(s);
+      scaleRef.current = s;
+
+      canvas.width = video.videoWidth * s;
+      canvas.height = video.videoHeight * s;
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width = canvas.width;
+      offscreen.height = canvas.height;
+      const offCtx = offscreen.getContext('2d');
+      if (offCtx) {
+        offCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        try {
+          frameBitmapRef.current?.close();
+          frameBitmapRef.current = await createImageBitmap(offscreen);
+        } catch {
+          frameBitmapRef.current = null;
+        }
+      }
+
+      const fullCanvas = new OffscreenCanvas(video.videoWidth, video.videoHeight);
+      const fullCtx = fullCanvas.getContext('2d')!;
+      fullCtx.drawImage(video, 0, 0);
+      const fullImageData = fullCtx.getImageData(0, 0, video.videoWidth, video.videoHeight);
+      const detected = autoDetectCropRegion(fullImageData);
+      setCrop(detected);
+      cropRef.current = detected;
+
+      const depthResult = autoDetectDepthMax(fullImageData, detected);
+      if (depthResult !== null) {
+        setDetectedDepth(depthResult);
+        setBeam((b: typeof beam) => ({ ...b, depthMaxM: depthResult }));
+        setDepthSliderIdx(depthToSliderIndex(depthResult));
+        setAutoDepth(true);
+      }
+
+      if (isBlobUrl) URL.revokeObjectURL(url);
+      if (!disposed) setFrameReady(true);
+    };
+
+    video.src = url;
+    return () => { disposed = true; if (isBlobUrl) URL.revokeObjectURL(url); };
+  }, [phase, state.videoFile, state.videoUrl]);
+
+  // ─── Draw crop overlay ──────────
+  const drawCropOverlay = useCallback(() => {
+    const canvas = canvasRef.current;
+    const bitmap = frameBitmapRef.current;
+    if (!canvas || !bitmap) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const c = cropRef.current;
+    const s = scaleRef.current;
+
+    ctx.drawImage(bitmap, 0, 0);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const cx = c.x * s;
+    const cy = c.y * s;
+    const cw = c.width * s;
+    const ch = c.height * s;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(cx, cy, cw, ch);
+    ctx.clip();
+    ctx.drawImage(bitmap, 0, 0);
+    ctx.restore();
+
+    ctx.strokeStyle = '#8A7CFF';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(cx, cy, cw, ch);
+    ctx.setLineDash([]);
+
+    const hs = 8;
+    ctx.fillStyle = '#8A7CFF';
+    for (const [hx, hy] of [[cx, cy], [cx + cw, cy], [cx, cy + ch], [cx + cw, cy + ch]]) {
+      ctx.fillRect(hx - hs / 2, hy - hs / 2, hs, hs);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (frameReady) drawCropOverlay();
+  }, [frameReady, crop, scale, drawCropOverlay]);
+
+  // ─── Mouse events ─────────────────
+  const getCanvasCoords = useCallback(
+    (e: React.MouseEvent) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return { x: 0, y: 0 };
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: Math.round((e.clientX - rect.left) / scaleRef.current),
+        y: Math.round((e.clientY - rect.top) / scaleRef.current),
+      };
+    },
+    [],
+  );
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      dragStartRef.current = getCanvasCoords(e);
+      draggingRef.current = true;
+    },
+    [getCanvasCoords],
+  );
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      if (!draggingRef.current || !dragStartRef.current) return;
+
+      const coords = getCanvasCoords(e);
+      const start = dragStartRef.current;
+      const x = Math.max(0, Math.min(start.x, coords.x));
+      const y = Math.max(0, Math.min(start.y, coords.y));
+      const w = Math.abs(coords.x - start.x);
+      const h = Math.abs(coords.y - start.y);
+      const newCrop = {
+        x,
+        y,
+        width: Math.max(20, Math.min(w, state.videoWidth - x)),
+        height: Math.max(20, Math.min(h, state.videoHeight - y)),
+      };
+
+      cropRef.current = newCrop;
+
+      if (!rafIdRef.current) {
+        rafIdRef.current = requestAnimationFrame(() => {
+          rafIdRef.current = 0;
+          drawCropOverlay();
+          setCrop(cropRef.current);
+        });
+      }
+    },
+    [getCanvasCoords, drawCropOverlay, state.videoWidth, state.videoHeight],
+  );
+
+  const handleMouseUp = useCallback(() => {
+    draggingRef.current = false;
+    dragStartRef.current = null;
+    if (rafIdRef.current) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = 0;
+    }
+    setCrop(cropRef.current);
+    drawCropOverlay();
+  }, [drawCropOverlay]);
+
+  // ─── V2 Processing pipeline (delegated to pipeline-store) ────────────
+
+  const runPipeline = useCallback(async () => {
+    if (!state.videoFile) return;
+    setPhase('processing');
+
+    await runStorePipeline({
+      videoFile: state.videoFile,
+      videoUrl: state.videoUrl,
+      gpxTrack: state.gpxTrack,
+      gpxFile: state.gpxFile,
+      videoDurationS: state.videoDurationS,
+      crop,
+      preprocessing,
+      beam,
+      grid,
+      fpsExtraction,
+      progressMessage: (key: string) => t(`v2.pipeline.${key}` as any),
+    });
+  }, [state, crop, preprocessing, beam, grid, fpsExtraction, t]);
+
+  const memEstimate = estimateVolumeMemoryMB(grid);
+
+  // ─── Publish session to repo ─────────────────────────────────────────
+  const [publishing, setPublishing] = useState(false);
+
+  const handlePublish = useCallback(async () => {
+    setPublishing(true);
+    setPublishError(null);
+    try {
+      await publishToRepo();
+      setPublished(true);
+    } catch (err) {
+      setPublishError(`Erreur: ${(err as Error).message}`);
+    } finally {
+      setPublishing(false);
+    }
+  }, []);
+
+  // ─── Render ───────────────────────────────────────────────────────────
+
+  return (
+    <div style={{ background: colors.black, minHeight: '100%', display: 'flex', flexDirection: 'column' }}>
+      {/* Pipeline Step Indicator — slides up when viewer is reached */}
+      {stepBarVisible && (
+        <div
+          style={{
+            padding: '12px var(--content-gutter) 0',
+            flexShrink: 0,
+            willChange: stepBarAnimating ? 'transform, opacity' : 'auto',
+            transition: 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1), opacity 600ms ease',
+            transform: stepBarAnimating ? 'translateY(-100%)' : 'translateY(0)',
+            opacity: stepBarAnimating ? 0 : 1,
+          }}
+        >
+          <StepIndicator
+            steps={PIPELINE_STEP_KEYS.map((s) => ({ label: t(s.labelKey as any), key: s.key }))}
+            currentStep={phaseToStepIndex(phase)}
+            processingProgress={phase === 'processing' && progress ? progress.progress : undefined}
+            onStepClick={(idx: number) => {
+              const target = PIPELINE_STEP_KEYS[idx];
+              if (!target) return;
+              if (idx < phaseToStepIndex(phase) && phase !== 'processing') {
+                setPhase(target.key as ScanPhase);
+              }
+            }}
+          />
+        </div>
+      )}
+
+      <div className="scan-content" style={{ padding: phase === 'viewer' ? 0 : 'clamp(8px, 1.5vw, 16px) var(--content-gutter)', flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+
+        {/* ── Import Phase ──────────────────────────────────────────── */}
+        {phase === 'import' && (
+          <div style={{ flex: 1, overflow: 'auto' }}>
+            <h1 style={{ color: colors.text1, fontSize: 'clamp(24px, 3vw, 36px)', fontWeight: 600, marginBottom: '8px' }}>
+              {t('v2.scan.title')}
+            </h1>
+            <p style={{ color: colors.text2, fontSize: '15px', marginBottom: '32px', lineHeight: 1.6, maxWidth: '700px' }}>
+              {t('v2.scan.desc')}
+            </p>
+
+            <div className="scan-import-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '24px' }}>
+              <GlassPanel style={{ padding: '24px' }}>
+                <h3 style={{ color: colors.text1, fontSize: '14px', marginBottom: '12px' }}>
+                  {t('import.dropVideo')}
+                </h3>
+                <FileDropZone
+                  accept="video/mp4,video/*"
+                  onFile={(file: File) => handleVideoFile([file])}
+                  label={state.videoFile ? state.videoFile.name : t('import.dropVideo')}
+                  hint={t('import.videoHint')}
+                />
+              </GlassPanel>
+
+              <GlassPanel style={{ padding: '24px' }}>
+                <h3 style={{ color: colors.text1, fontSize: '14px', marginBottom: '12px' }}>
+                  {t('import.dropGpx')}
+                  <span style={{ fontWeight: 400, fontSize: '12px', color: colors.accent, marginLeft: '8px' }}>
+                    ({t('common.optional')})
+                  </span>
+                </h3>
+                <FileDropZone
+                  accept=".gpx"
+                  onFile={(file: File) => handleGpxFile([file])}
+                  label={state.gpxFile ? state.gpxFile.name : t('import.dropGpx')}
+                  hint={t('import.gpxHint')}
+                />
+              </GlassPanel>
+            </div>
+
+            {state.error && (
+              <div style={{
+                background: 'rgba(239, 68, 68, 0.1)',
+                border: `1px solid ${colors.error}`,
+                borderRadius: '12px',
+                padding: '14px 18px',
+                color: colors.error,
+                fontSize: '15px',
+                marginBottom: '16px',
+              }}>
+                {state.error}
+              </div>
+            )}
+
+            {canConfigure && (
+              <div className="scan-next-btn" style={{ textAlign: 'center', marginTop: '16px', paddingBottom: '16px' }}>
+                <Button variant="primary" size="lg" onClick={() => setPhase('crop')}>
+                  {t('common.next')}
+                </Button>
+              </div>
+            )}
+
+            {noFilesYet && (
+              <div className="scan-no-files" style={{
+                display: 'flex',
+                justifyContent: 'center',
+                alignItems: 'center',
+                gap: '12px',
+                marginTop: '48px',
+              }}>
+                <span style={{ fontSize: '14px', color: colors.text3 }}>
+                  {t('common.noFiles')}
+                </span>
+                <button
+                  onClick={handleLoadTest}
+                  disabled={loadingTest}
+                  style={{
+                    padding: '8px 20px',
+                    borderRadius: '9999px',
+                    border: `1.5px solid ${colors.accent}`,
+                    background: 'transparent',
+                    color: colors.accent,
+                    fontSize: '14px',
+                    fontWeight: 600,
+                    fontFamily: 'inherit',
+                    cursor: 'pointer',
+                    transition: 'all 150ms ease',
+                    opacity: loadingTest ? 0.7 : 1,
+                    position: 'relative',
+                  }}
+                  className="echos-action-btn"
+                >
+                  <span style={{ visibility: loadingTest ? 'hidden' : 'visible' }}>test</span>
+                  {loadingTest && (
+                    <span style={{
+                      position: 'absolute',
+                      inset: 0,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}>
+                      <span style={{
+                        display: 'inline-block',
+                        width: '14px',
+                        height: '14px',
+                        border: '2px solid color-mix(in srgb, currentColor 20%, transparent)',
+                        borderTopColor: 'currentColor',
+                        borderRadius: '50%',
+                        animation: 'echos-spin 0.8s linear infinite',
+                      }} />
+                    </span>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Crop Phase ─────────────────────── */}
+        {phase === 'crop' && (
+          <div className="scan-crop-phase" style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+            <h2 style={{ color: colors.text1, fontSize: 'clamp(18px, 2vw, 24px)', fontWeight: 600, marginBottom: '4px', flexShrink: 0 }}>
+              {t('crop.title')}
+            </h2>
+            <p style={{ color: colors.text2, fontSize: '13px', marginBottom: '12px', lineHeight: 1.4, maxWidth: '640px', flexShrink: 0 }}>
+              {t('crop.desc')}
+            </p>
+
+            <GlassPanel className="scan-crop-panel" style={{ padding: '12px', marginBottom: '12px', flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div
+                ref={containerRef}
+                style={{
+                  position: 'relative',
+                  display: 'flex',
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  cursor: 'crosshair',
+                  flex: 1,
+                  overflow: 'hidden',
+                }}
+              >
+                <canvas
+                  ref={canvasRef}
+                  onMouseDown={handleMouseDown}
+                  onMouseMove={handleMouseMove}
+                  onMouseUp={handleMouseUp}
+                  onMouseLeave={handleMouseUp}
+                  style={{ borderRadius: '8px', maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+                />
+                {!frameReady && (
+                  <div style={{
+                    position: 'absolute',
+                    inset: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: colors.text3,
+                    fontSize: '15px',
+                  }}>
+                    {t('v2.preview.analyzing')}
+                  </div>
+                )}
+              </div>
+
+              <div className="scan-crop-info" style={{
+                marginTop: '8px',
+                display: 'grid',
+                gridTemplateColumns: 'repeat(4, 1fr)',
+                gap: '8px',
+                flexShrink: 0,
+              }}>
+                {[
+                  { label: 'X', value: crop.x },
+                  { label: 'Y', value: crop.y },
+                  { label: 'W', value: crop.width },
+                  { label: 'H', value: crop.height },
+                ].map(({ label, value }) => (
+                  <div key={label} style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: '11px', color: colors.text3, marginBottom: '2px' }}>{label}</div>
+                    <div style={{ fontSize: '14px', fontWeight: 600, color: colors.accent, fontVariantNumeric: 'tabular-nums' }}>
+                      {value}px
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </GlassPanel>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', flexShrink: 0 }}>
+              <Button variant="ghost" size="lg" onClick={() => setPhase('import')}>
+                {t('common.back')}
+              </Button>
+              <Button
+                variant="primary"
+                size="lg"
+                disabled={crop.width < 20 || crop.height < 20}
+                onClick={() => setPhase('settings')}
+              >
+                {t('common.next')}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* ── Settings Phase (includes sync + processing overlay) ─── */}
+        {(phase === 'settings' || phase === 'processing') && (
+          <div style={{ flex: 1, overflow: phase === 'processing' ? 'hidden' : 'auto', position: 'relative' }}>
+            {/* Processing overlay — minimal, centered */}
+            {phase === 'processing' && progress && (
+              <div style={{
+                position: 'absolute',
+                inset: 0,
+                zIndex: 20,
+                background: 'var(--c-black)',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                paddingBottom: '12vh',
+                transition: 'opacity 600ms ease',
+              }}>
+                <div style={{ width: '100%', maxWidth: '480px', textAlign: 'center' }}>
+                  {progress.stage === 'ready' ? (
+                    /* Completion state — checkmark animation */
+                    <div style={{ animation: 'echos-fade-in 400ms ease' }}>
+                      <div style={{
+                        width: '64px',
+                        height: '64px',
+                        borderRadius: '50%',
+                        background: colors.accentMuted,
+                        border: `2px solid ${colors.accent}`,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        margin: '0 auto 20px',
+                        animation: 'echos-scale-in 400ms cubic-bezier(0.34, 1.56, 0.64, 1)',
+                      }}>
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={colors.accent} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                      </div>
+                      <div style={{ fontSize: '16px', fontWeight: 600, color: colors.text1 }}>
+                        {t('v2.pipeline.ready')}
+                      </div>
+                    </div>
+                  ) : (
+                    /* Progress state */
+                    <>
+                      <div style={{
+                        fontSize: '48px',
+                        fontWeight: 700,
+                        color: colors.text1,
+                        fontVariantNumeric: 'tabular-nums',
+                        lineHeight: 1,
+                        marginBottom: '20px',
+                        letterSpacing: '-0.02em',
+                      }}>
+                        {Math.round(progress.progress * 100)}%
+                      </div>
+
+                      <ProgressBar value={progress.progress} showPercent={false} height={6} />
+
+                      <div style={{ marginTop: '32px' }}>
+                        <button
+                          onClick={() => {
+                            abortPipeline();
+                            setPhase('settings');
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.background = colors.accentMuted;
+                            e.currentTarget.style.color = colors.accent;
+                            e.currentTarget.style.borderColor = colors.accent;
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.background = colors.surface;
+                            e.currentTarget.style.color = colors.text1;
+                            e.currentTarget.style.borderColor = 'transparent';
+                          }}
+                          style={{
+                            padding: '10px 24px',
+                            borderRadius: '9999px',
+                            border: '1px solid transparent',
+                            background: colors.surface,
+                            color: colors.text1,
+                            fontSize: '14px',
+                            fontWeight: 500,
+                            cursor: 'pointer',
+                            fontFamily: 'inherit',
+                            transition: 'all 150ms ease',
+                            letterSpacing: '-0.01em',
+                          }}
+                        >
+                          {t('v2.pipeline.abort')}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <h2 style={{ color: colors.text1, fontSize: 'clamp(18px, 2vw, 24px)', fontWeight: 600, marginBottom: '4px' }}>
+              {t('v2.settings.title')}
+            </h2>
+            <p style={{ color: colors.text2, fontSize: '13px', marginBottom: '12px', lineHeight: 1.5, maxWidth: '700px' }}>
+              {t('v2.settings.desc')}
+            </p>
+
+            {/* Quality preset selector — big centered titles, minimal info */}
+            <GlassPanel style={{ padding: '16px', marginBottom: '12px' }}>
+              <div className="scan-quality-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px' }}>
+                {(['minimal', 'medium', 'complete'] as const).map((q) => {
+                  const selected = quality === q;
+                  const cfg = QUALITY_PRESETS[q];
+                  const accentMap = { minimal: '#22c55e', medium: colors.accent, complete: '#f59e0b' };
+                  const color = accentMap[q];
+                  const titleMap = {
+                    minimal: t('v2.quality.minimal' as any),
+                    medium: t('v2.quality.medium' as any),
+                    complete: t('v2.quality.complete' as any),
+                  };
+                  const hintMap = lang === 'fr' ? {
+                    minimal: `${cfg.fps} image/s, aperçu en quelques secondes`,
+                    medium: `${cfg.fps} images/s, bon compromis`,
+                    complete: `${cfg.fps} images/s, qualité maximale`,
+                  } : {
+                    minimal: `${cfg.fps} fps, preview in seconds`,
+                    medium: `${cfg.fps} fps, good trade-off`,
+                    complete: `${cfg.fps} fps, max quality`,
+                  };
+                  return (
+                    <button
+                      key={q}
+                      onClick={() => setQuality(q)}
+                      style={{
+                        padding: '18px 14px',
+                        borderRadius: '12px',
+                        border: `2px solid ${selected ? color : colors.border}`,
+                        background: selected ? `${color}15` : 'transparent',
+                        cursor: 'pointer',
+                        textAlign: 'center',
+                        transition: 'all 150ms ease',
+                      }}
+                    >
+                      <div style={{ color: selected ? color : colors.text1, fontWeight: 700, fontSize: '20px', marginBottom: '6px' }}>
+                        {titleMap[q]}
+                      </div>
+                      <div style={{ color: colors.text3, fontSize: '11px', lineHeight: 1.4 }}>
+                        {hintMap[q]}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </GlassPanel>
+
+            {/* Synchronization section — only when GPX is loaded */}
+            {state.gpxTrack && (
+            <GlassPanel style={{ padding: '14px', marginBottom: '10px' }}>
+              <h3 style={{ color: colors.text1, fontSize: '14px', fontWeight: 600, marginBottom: '8px' }}>
+                {t('v2.sync.title')}
+              </h3>
+
+              <div className="scan-sync-stats" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '8px', marginBottom: '8px' }}>
+                <div style={{ padding: '8px 12px', borderRadius: '8px', background: colors.surface }}>
+                  <div style={{ fontSize: '11px', color: colors.text3, marginBottom: '2px' }}>{t('v2.sync.videoDuration')}</div>
+                  <div style={{ fontSize: '16px', fontWeight: 600, color: colors.text1 }}>{state.videoDurationS.toFixed(1)}s</div>
+                </div>
+                <div style={{ padding: '8px 12px', borderRadius: '8px', background: colors.surface }}>
+                  <div style={{ fontSize: '11px', color: colors.text3, marginBottom: '2px' }}>{t('v2.sync.gpxDuration')}</div>
+                  <div style={{ fontSize: '16px', fontWeight: 600, color: colors.text1 }}>{state.gpxTrack?.durationS.toFixed(1) ?? '-'}s</div>
+                </div>
+                <div style={{ padding: '8px 12px', borderRadius: '8px', background: colors.surface }}>
+                  <div style={{ fontSize: '11px', color: colors.text3, marginBottom: '2px' }}>{t('v2.sync.totalDist')}</div>
+                  <div style={{ fontSize: '16px', fontWeight: 600, color: colors.text1 }}>{maxDist.toFixed(0)} m</div>
+                </div>
+                <div style={{ padding: '8px 12px', borderRadius: '8px', background: colors.surface }}>
+                  <div style={{ fontSize: '11px', color: colors.text3, marginBottom: '2px' }}>{t('v2.sync.avgSpeed')}</div>
+                  <div style={{ fontSize: '16px', fontWeight: 600, color: colors.text1 }}>
+                    {state.gpxTrack && state.gpxTrack.durationS > 0
+                      ? (maxDist / state.gpxTrack.durationS).toFixed(1)
+                      : '-'}{' '}
+                    m/s
+                  </div>
+                </div>
+              </div>
+
+              {/* Chart with trim zones */}
+              <div style={{ marginBottom: '8px' }}>
+                <div style={{ fontSize: '11px', color: colors.text3, marginBottom: '3px' }}>
+                  {t('v2.sync.distOverTime')}
+                </div>
+                <svg
+                  viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+                  style={{ width: '100%', height: '80px', background: colors.surface, borderRadius: '8px' }}
+                >
+                  {/* Trim start zone (left, red overlay) */}
+                  {state.sync.trimStartS > 0 && state.gpxTrack && (
+                    <rect
+                      x={0}
+                      y={0}
+                      width={(state.sync.trimStartS / (state.gpxTrack.durationS || 1)) * chartWidth}
+                      height={chartHeight}
+                      fill="rgba(248, 113, 113, 0.15)"
+                    />
+                  )}
+                  {state.sync.trimStartS > 0 && state.gpxTrack && (
+                    <line
+                      x1={(state.sync.trimStartS / (state.gpxTrack.durationS || 1)) * chartWidth}
+                      y1={0}
+                      x2={(state.sync.trimStartS / (state.gpxTrack.durationS || 1)) * chartWidth}
+                      y2={chartHeight}
+                      stroke={colors.success}
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                    />
+                  )}
+                  {/* Trim end zone (right, red overlay) */}
+                  {state.sync.trimEndS > 0 && state.gpxTrack && (
+                    <rect
+                      x={chartWidth - (state.sync.trimEndS / (state.gpxTrack.durationS || 1)) * chartWidth}
+                      y={0}
+                      width={(state.sync.trimEndS / (state.gpxTrack.durationS || 1)) * chartWidth}
+                      height={chartHeight}
+                      fill="rgba(248, 113, 113, 0.15)"
+                    />
+                  )}
+                  {state.sync.trimEndS > 0 && state.gpxTrack && (
+                    <line
+                      x1={chartWidth - (state.sync.trimEndS / (state.gpxTrack.durationS || 1)) * chartWidth}
+                      y1={0}
+                      x2={chartWidth - (state.sync.trimEndS / (state.gpxTrack.durationS || 1)) * chartWidth}
+                      y2={chartHeight}
+                      stroke={colors.error}
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                    />
+                  )}
+                  <polyline
+                    points={chartPoints}
+                    fill="none"
+                    stroke={colors.accent}
+                    strokeWidth={2}
+                  />
+                </svg>
+              </div>
+
+              {/* Two trim sliders side by side */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+                <Slider
+                  label={t('v2.sync.trimStart')}
+                  value={state.sync.trimStartS}
+                  min={0}
+                  max={Math.floor((state.gpxTrack?.durationS ?? 60) / 2)}
+                  step={0.5}
+                  unit=" s"
+                  tooltip={t('v2.sync.trimStartTooltip')}
+                  onChange={(v) => dispatch({ type: 'SET_SYNC', sync: { trimStartS: v } })}
+                />
+                <Slider
+                  label={t('v2.sync.trimEnd')}
+                  value={state.sync.trimEndS}
+                  min={0}
+                  max={Math.floor((state.gpxTrack?.durationS ?? 60) / 2)}
+                  step={0.5}
+                  unit=" s"
+                  tooltip={t('v2.sync.trimEndTooltip')}
+                  onChange={(v) => dispatch({ type: 'SET_SYNC', sync: { trimEndS: v } })}
+                />
+              </div>
+            </GlassPanel>
+            )}
+
+            {/* Summary — minimal */}
+            <GlassPanel style={{ padding: '12px', marginBottom: '12px' }}>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(3, 1fr)',
+                gap: '12px',
+                fontSize: '13px',
+              }}>
+                <div>
+                  <div style={{ color: colors.text3, fontSize: '11px', marginBottom: '2px' }}>{t('v2.preview.frames')}</div>
+                  <div style={{ color: colors.text1, fontWeight: 500 }}>~{Math.floor(state.videoDurationS * fpsExtraction)}</div>
+                </div>
+                <div>
+                  <div style={{ color: colors.text3, fontSize: '11px', marginBottom: '2px' }}>{t('v2.preview.distance')}</div>
+                  <div style={{ color: colors.text1, fontWeight: 500 }}>{state.gpxTrack ? `${state.gpxTrack.totalDistanceM.toFixed(0)}m` : '-'}</div>
+                </div>
+                <div>
+                  <div style={{ color: colors.text3, fontSize: '11px', marginBottom: '2px' }}>{t('v2.config.memory')}</div>
+                  <div style={{ color: memEstimate > 512 ? colors.error : colors.text1, fontWeight: 500 }}>~{memEstimate.toFixed(0)} MB</div>
+                </div>
+              </div>
+            </GlassPanel>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <Button variant="ghost" size="lg" onClick={() => setPhase('crop')}>
+                {t('common.back')}
+              </Button>
+              <Button variant="primary" size="lg" onClick={runPipeline} disabled={phase === 'processing'}>
+                {t('v2.config.generate')}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* ── Viewer Phase ──────────────────────────────────────────── */}
+        {phase === 'viewer' && (
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, animation: 'echos-fade-in 500ms ease' }}>
+            <ViewerErrorBoundary onReset={() => {
+              setStepBarVisible(true);
+              setStepBarAnimating(false);
+              setPhase('settings');
+            }}>
+              <VolumeViewer
+                volumeData={volumeData}
+                dimensions={volumeDims}
+                extent={volumeExtent}
+                frames={instrumentFrames ?? undefined}
+                beam={beam}
+                grid={grid}
+                gpxTrack={state.gpxTrack ?? undefined}
+                videoFileName={state.videoFile?.name}
+                gpxFileName={state.gpxFile?.name}
+                videoDurationS={state.videoDurationS}
+                onReconfigure={() => {
+                  setStepBarVisible(true);
+                  setStepBarAnimating(false);
+                  setPhase('settings');
+                }}
+                onNewScan={() => {
+                  resetPipeline();
+                  setStepBarVisible(true);
+                  setStepBarAnimating(false);
+                  setPhase('import');
+                  setVolumeData(null);
+                  setFrameReady(false);
+                  setPublished(false);
+                  setPublishError(null);
+                }}
+                onPublish={handlePublish}
+                published={published}
+                publishing={publishing}
+                publishError={publishError}
+              />
+            </ViewerErrorBoundary>
+          </div>
+        )}
+      </div>
+
+    </div>
+  );
+}

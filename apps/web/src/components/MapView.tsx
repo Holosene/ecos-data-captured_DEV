@@ -1,0 +1,381 @@
+/**
+ * ECOS V2 — Map View Component
+ *
+ * Leaflet-based map displaying recording sessions as GPS traces.
+ * Each recording is an independent entity.
+ * Clicking a recording loads its volumetric viewer.
+ */
+
+import React, { useRef, useEffect, useCallback, useState } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import type { RecordingSession } from '@echos/core';
+import { colors } from '@echos/ui';
+import { useTranslation } from '../i18n/index.js';
+
+interface MapViewProps {
+  sessions: RecordingSession[];
+  selectedSessionId: string | null;
+  onSessionSelect: (id: string) => void;
+  gpxTracks?: Map<string, Array<{ lat: number; lon: number }>>;
+  theme?: string;
+  /** When true, zoom very deep on the selected session */
+  deepFocus?: boolean;
+  /** Base path for static assets (thumbnails) */
+  basePath?: string;
+  /** Manifest entries for thumbnail URLs */
+  manifestEntries?: Array<{ id: string; files: { thumbnail?: string } }>;
+}
+
+export function MapView({
+  sessions,
+  selectedSessionId,
+  onSessionSelect,
+  gpxTracks,
+  theme,
+  deepFocus,
+  basePath,
+  manifestEntries,
+}: MapViewProps) {
+  const mapRef = useRef<HTMLDivElement>(null);
+  const leafletMap = useRef<L.Map | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const layersRef = useRef<Map<string, L.Polyline>>(new Map());
+  const hitLayersRef = useRef<L.Polyline[]>([]);
+  const { t } = useTranslation();
+  const [showTouchHint, setShowTouchHint] = useState(false);
+  const touchHintTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Initialize map
+  useEffect(() => {
+    if (!mapRef.current || leafletMap.current) return;
+
+    const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
+    const map = L.map(mapRef.current, {
+      center: [46.6, 2.3],
+      zoom: 6,
+      zoomControl: false,
+      scrollWheelZoom: false,
+      attributionControl: false,
+      dragging: !isTouchDevice,
+    });
+
+    // Custom zoom control positioned top-right
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    const tileUrl = theme === 'light'
+      ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+      : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+    const tileLayer = L.tileLayer(tileUrl, { maxZoom: 19 }).addTo(map);
+    tileLayerRef.current = tileLayer;
+
+    // Enable scroll-wheel zoom only after user clicks on the map
+    map.on('click', () => {
+      map.scrollWheelZoom.enable();
+    });
+    // Disable again when mouse leaves the map
+    map.on('mouseout', () => {
+      map.scrollWheelZoom.disable();
+    });
+
+    leafletMap.current = map;
+
+    return () => {
+      map.remove();
+      leafletMap.current = null;
+    };
+  }, []);
+
+  // Swap tile layer when theme changes
+  useEffect(() => {
+    if (!tileLayerRef.current) return;
+    const tileUrl = theme === 'light'
+      ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+      : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+    tileLayerRef.current.setUrl(tileUrl);
+  }, [theme]);
+
+  // Update session layers
+  useEffect(() => {
+    const map = leafletMap.current;
+    if (!map) return;
+
+    // Clear old layers
+    layersRef.current.forEach((layer) => layer.remove());
+    layersRef.current.clear();
+    hitLayersRef.current.forEach((layer) => layer.remove());
+    hitLayersRef.current = [];
+
+    const bounds = L.latLngBounds([]);
+
+    sessions.forEach((session) => {
+      const track = gpxTracks?.get(session.id);
+      if (!track || track.length < 2) {
+        // Use bounds if no track data
+        if (session.bounds) {
+          const [minLat, minLon, maxLat, maxLon] = session.bounds;
+          const center = L.latLng((minLat + maxLat) / 2, (minLon + maxLon) / 2);
+          bounds.extend(center);
+
+          const marker = L.circleMarker(center, {
+            radius: 8,
+            color: session.id === selectedSessionId ? '#4488ff' : '#8866ff',
+            fillColor: session.id === selectedSessionId ? '#4488ff' : '#8866ff',
+            fillOpacity: 0.6,
+            weight: 2,
+          })
+            .addTo(map)
+            .on('click', () => onSessionSelect(session.id));
+
+          const thumbUrl = getThumbnailUrl(session.id, basePath, manifestEntries);
+          marker.bindPopup(createPopupContent(session, thumbUrl));
+        }
+        return;
+      }
+
+      const latLngs = track.map((p) => L.latLng(p.lat, p.lon));
+      latLngs.forEach((ll) => bounds.extend(ll));
+
+      const isSelected = session.id === selectedSessionId;
+
+      // Invisible wide polyline for easier clicking (hitbox)
+      const hitArea = L.polyline(latLngs, {
+        color: 'transparent',
+        weight: 24,
+        opacity: 0,
+        smoothFactor: 1.5,
+      })
+        .addTo(map)
+        .on('click', () => onSessionSelect(session.id));
+
+      // Visible polyline
+      const polyline = L.polyline(latLngs, {
+        color: isSelected ? '#4488ff' : '#8866ff',
+        weight: isSelected ? 5 : 3,
+        opacity: isSelected ? 1.0 : 0.7,
+        smoothFactor: 1.5,
+      })
+        .addTo(map)
+        .on('click', () => onSessionSelect(session.id));
+
+      const thumbnailUrl = getThumbnailUrl(session.id, basePath, manifestEntries);
+      polyline.bindPopup(createPopupContent(session, thumbnailUrl));
+      hitArea.bindPopup(createPopupContent(session, thumbnailUrl));
+      hitLayersRef.current.push(hitArea);
+      layersRef.current.set(session.id, polyline);
+    });
+
+  }, [sessions, selectedSessionId, gpxTracks, onSessionSelect, basePath, manifestEntries]);
+
+  // Fit bounds only when sessions or gpxTracks change — not on selection change
+  const prevSessionsRef = useRef<string>('');
+  useEffect(() => {
+    const map = leafletMap.current;
+    if (!map || sessions.length === 0) return;
+
+    // Build a stable key from session IDs + track availability to avoid redundant zooms
+    const key = sessions.map((s) => s.id).join(',') + '|' + (gpxTracks?.size ?? 0);
+    if (key === prevSessionsRef.current) return;
+    prevSessionsRef.current = key;
+
+    const bounds = L.latLngBounds([]);
+    sessions.forEach((session) => {
+      const track = gpxTracks?.get(session.id);
+      if (track && track.length >= 2) {
+        track.forEach((p) => bounds.extend(L.latLng(p.lat, p.lon)));
+      } else if (session.bounds) {
+        const [minLat, minLon, maxLat, maxLon] = session.bounds;
+        bounds.extend(L.latLng((minLat + maxLat) / 2, (minLon + maxLon) / 2));
+      }
+    });
+
+    if (bounds.isValid()) {
+      map.fitBounds(bounds, { padding: [20, 20], maxZoom: 18 });
+    }
+  }, [sessions, gpxTracks]);
+
+  // Deep focus zoom when a session is selected and deepFocus is true
+  // When deepFocus goes false, restore the global bounds view
+  const prevDeepFocusRef = useRef(deepFocus);
+  useEffect(() => {
+    const map = leafletMap.current;
+    if (!map) return;
+
+    const wasFocused = prevDeepFocusRef.current;
+    prevDeepFocusRef.current = deepFocus;
+
+    if (deepFocus && selectedSessionId) {
+      const session = sessions.find((s) => s.id === selectedSessionId);
+      if (!session) return;
+
+      const track = gpxTracks?.get(session.id);
+      if (track && track.length >= 2) {
+        const latLngs = track.map((p) => L.latLng(p.lat, p.lon));
+        const traceBounds = L.latLngBounds(latLngs);
+        map.fitBounds(traceBounds, { padding: [20, 20], maxZoom: 18, animate: true });
+      } else if (session.bounds) {
+        const [minLat, minLon, maxLat, maxLon] = session.bounds;
+        const center = L.latLng((minLat + maxLat) / 2, (minLon + maxLon) / 2);
+        map.setView(center, 16, { animate: true });
+      }
+
+      // Invalidate size after container transitions
+      setTimeout(() => map.invalidateSize(), 350);
+    } else if (wasFocused && !deepFocus) {
+      // Closing panel — invalidate size after CSS transition, then restore all-sessions bounds
+      setTimeout(() => {
+        map.invalidateSize();
+        // Recompute bounds for all sessions
+        const allBounds = L.latLngBounds([]);
+        sessions.forEach((session) => {
+          const track = gpxTracks?.get(session.id);
+          if (track && track.length >= 2) {
+            track.forEach((p) => allBounds.extend(L.latLng(p.lat, p.lon)));
+          } else if (session.bounds) {
+            const [minLat, minLon, maxLat, maxLon] = session.bounds;
+            allBounds.extend(L.latLng((minLat + maxLat) / 2, (minLon + maxLon) / 2));
+          }
+        });
+        if (allBounds.isValid()) {
+          map.fitBounds(allBounds, { padding: [20, 20], maxZoom: 18, animate: true });
+        }
+      }, 450);
+    }
+  }, [deepFocus, selectedSessionId, sessions, gpxTracks]);
+
+  // Two-finger touch handling — show hint on single-finger, enable drag on two-finger
+  useEffect(() => {
+    const map = leafletMap.current;
+    const el = mapRef.current;
+    if (!map || !el) return;
+
+    const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    if (!isTouchDevice) return;
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length >= 2) {
+        map.dragging.enable();
+        setShowTouchHint(false);
+        if (touchHintTimer.current) clearTimeout(touchHintTimer.current);
+      } else if (e.touches.length === 1) {
+        map.dragging.disable();
+        setShowTouchHint(true);
+        if (touchHintTimer.current) clearTimeout(touchHintTimer.current);
+        touchHintTimer.current = setTimeout(() => setShowTouchHint(false), 1500);
+      }
+    };
+
+    const handleTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2) {
+        map.dragging.disable();
+      }
+    };
+
+    el.addEventListener('touchstart', handleTouchStart, { passive: true });
+    el.addEventListener('touchend', handleTouchEnd, { passive: true });
+
+    return () => {
+      el.removeEventListener('touchstart', handleTouchStart);
+      el.removeEventListener('touchend', handleTouchEnd);
+      if (touchHintTimer.current) clearTimeout(touchHintTimer.current);
+    };
+  }, []);
+
+  return (
+    <div style={{ position: 'relative', height: '100%', minHeight: '300px' }}>
+      <div
+        ref={mapRef}
+        style={{
+          width: '100%',
+          height: '100%',
+          borderRadius: '12px',
+          overflow: 'hidden',
+          border: `1px solid ${colors.border}`,
+        }}
+      />
+      {/* Two-finger touch hint overlay */}
+      <div className={`map-touch-overlay${showTouchHint ? ' visible' : ''}`}>
+        <span>{t('v2.map.twoFingerHint')}</span>
+      </div>
+
+      {/* Accent tint overlay — colors water zones toward site accent */}
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          background: 'var(--c-accent)',
+          opacity: 0.12,
+          mixBlendMode: 'color',
+          pointerEvents: 'none',
+          zIndex: 2,
+          borderRadius: '12px',
+        }}
+      />
+
+      {sessions.length === 0 && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              padding: '16px 24px',
+              borderRadius: '12px',
+              background: 'rgba(0,0,0,0.7)',
+              color: colors.text2,
+              fontSize: '14px',
+              border: `1px solid ${colors.border}`,
+            }}
+          >
+            {t('v2.map.empty')}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function getThumbnailUrl(
+  sessionId: string,
+  basePath?: string,
+  manifestEntries?: Array<{ id: string; files: { thumbnail?: string } }>,
+): string | null {
+  if (!basePath || !manifestEntries) return null;
+  const entry = manifestEntries.find((e) => e.id === sessionId);
+  if (!entry?.files.thumbnail) return null;
+  return `${basePath}sessions/${sessionId}/${entry.files.thumbnail}`;
+}
+
+function createPopupContent(session: RecordingSession, thumbnailUrl?: string | null): string {
+  const thumbHtml = thumbnailUrl
+    ? `<img src="${escapeHtml(thumbnailUrl)}" alt="" style="width:100%;height:80px;object-fit:cover;border-radius:8px;margin-bottom:8px;background:#111;" onerror="this.style.display='none'" />`
+    : '';
+  return `
+    <div style="font-family: Inter, sans-serif; font-size: 13px; min-width: 200px; max-width: 260px;">
+      ${thumbHtml}
+      <strong style="font-size: 14px;">${escapeHtml(session.name)}</strong>
+      <div style="margin-top: 6px; color: #888;">
+        ${session.totalDistanceM.toFixed(0)} m &bull;
+        ${(session.durationS / 60).toFixed(1)} min &bull;
+        ${session.frameCount} frames
+      </div>
+      <div style="margin-top: 4px; color: #666; font-size: 11px;">
+        ${new Date(session.createdAt).toLocaleDateString()}
+      </div>
+    </div>
+  `;
+}
+
+function escapeHtml(str: string): string {
+  return str.replace(/[&<>"']/g, (c) => {
+    const map: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return map[c] || c;
+  });
+}

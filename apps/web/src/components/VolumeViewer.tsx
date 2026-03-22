@@ -1,0 +1,2176 @@
+/**
+ * ECOS V2 — Volume Viewer Component (Redesigned)
+ *
+ * Marketing-style presentation of 3 render modes:
+ *   - Cône (Instrument): static stacked cone volume
+ *   - Trace (Spatial): spatial volume (GPS or synthetic distance)
+ *   - Projection (Classic): windowed conic projection with temporal playback
+ *
+ * Design principles:
+ *   - Volumes presented as clean, borderless 3D elements
+ *   - Controls hidden by default — "Éditer" button reveals per-volume settings
+ *   - Grid/axes only visible in edit mode
+ *   - Leaflet-based interactive map for GPS visualization
+ *   - Calibration panel via "bbbbb" shortcut
+ */
+
+import React, { useRef, useEffect, useCallback, useState, useMemo } from 'react';
+import { GlassPanel, Slider, Button, colors, fonts } from '@echos/ui';
+import type { RendererSettings, ChromaticMode, PreprocessedFrame, BeamSettings, VolumeGridSettings } from '@echos/core';
+import { DEFAULT_RENDERER, projectFrameWindow, computeAutoThreshold } from '@echos/core';
+import { VolumeRenderer, DEFAULT_CALIBRATION, DEFAULT_CALIBRATION_B, DEFAULT_CALIBRATION_C } from '../engine/volume-renderer.js';
+import type { CameraPreset, CalibrationConfig } from '../engine/volume-renderer.js';
+import { VolumeRendererClassic } from '../engine/volume-renderer-classic.js';
+import { CalibrationPanel } from './CalibrationPanel.js';
+import { getChromaticModes, CHROMATIC_LABELS } from '../engine/transfer-function.js';
+import { SlicePanel } from './SlicePanel.js';
+import type { SlicePanelHandle } from './SlicePanel.js';
+import { ExportPanel } from './ExportPanel.js';
+import { downloadStandaloneHTML } from '../export/export-standalone-html.js';
+import { useTranslation } from '../i18n/index.js';
+import { useTheme } from '../theme/index.js';
+import type { TranslationKey } from '../i18n/translations.js';
+import type L_Type from 'leaflet';
+
+interface VolumeViewerProps {
+  /** Mode A (Instrument) data — always present */
+  volumeData: Float32Array | null;
+  dimensions: [number, number, number];
+  extent: [number, number, number];
+  /** Mode B (Spatial) data — always present */
+  spatialData?: Float32Array | null;
+  spatialDimensions?: [number, number, number];
+  spatialExtent?: [number, number, number];
+  /** Pre-computed classic (cone-projected) volume for Mode C (pre-generated sessions) */
+  classicData?: Float32Array | null;
+  classicDimensions?: [number, number, number];
+  classicExtent?: [number, number, number];
+  /** Preprocessed frames for Mode C + slices */
+  frames?: PreprocessedFrame[];
+  beam?: BeamSettings;
+  grid?: VolumeGridSettings;
+  /** GPX track for map */
+  gpxTrack?: { points: Array<{ lat: number; lon: number }>; totalDistanceM: number; durationS: number };
+  /** File info for the header zone */
+  videoFileName?: string;
+  gpxFileName?: string;
+  videoDurationS?: number;
+  onSettingsChange?: (settings: RendererSettings) => void;
+  onReconfigure?: () => void;
+  onNewScan?: () => void;
+  onClose?: () => void;
+  onPublish?: () => void;
+  published?: boolean;
+  publishing?: boolean;
+  publishError?: string | null;
+}
+
+const WINDOW_SIZE = 12;
+
+// ─── Extract a WINDOW_SIZE window from pre-computed spatial volume (Y axis) ──
+// Used by session viewer to replicate ScanPage's Mode B 12-frame window view.
+function extractSpatialWindow(
+  data: Float32Array,
+  dims: [number, number, number],
+  centerY: number,
+  windowSize: number,
+): { data: Float32Array; dimensions: [number, number, number]; extent: [number, number, number] } {
+  const [dimX, dimY, dimZ] = dims;
+  const half = Math.floor(windowSize / 2);
+  const start = Math.max(0, Math.min(centerY - half, dimY - windowSize));
+  const end = Math.min(dimY, start + windowSize);
+  const count = end - start;
+
+  if (count <= 0 || dimX === 0 || dimZ === 0) {
+    return { data: new Float32Array(1), dimensions: [1, 1, 1], extent: [1, 1, 1] };
+  }
+
+  const windowData = new Float32Array(dimX * count * dimZ);
+  const srcStride = dimY * dimX;
+  const dstStride = count * dimX;
+
+  for (let z = 0; z < dimZ; z++) {
+    for (let y = 0; y < count; y++) {
+      const srcOff = z * srcStride + (start + y) * dimX;
+      const dstOff = z * dstStride + y * dimX;
+      windowData.set(data.subarray(srcOff, srcOff + dimX), dstOff);
+    }
+  }
+
+  const aspect = dimX / dimZ;
+  return { data: windowData, dimensions: [dimX, count, dimZ], extent: [aspect, 0.5, 1] };
+}
+
+// ─── Build v1-style stacked volume from raw preprocessed frames ──────────
+function buildSliceVolumeFromFrames(
+  frameList: PreprocessedFrame[],
+): { data: Float32Array; dimensions: [number, number, number] } | null {
+  if (!frameList || frameList.length === 0) return null;
+  const dimX = frameList[0].width;
+  const dimY = frameList.length;
+  const dimZ = frameList[0].height;
+  if (dimX === 0 || dimZ === 0) return null;
+  const data = new Float32Array(dimX * dimY * dimZ);
+  const strideZ = dimY * dimX;
+  for (let yi = 0; yi < dimY; yi++) {
+    const intensity = frameList[yi].intensity;
+    const yiOffset = yi * dimX;
+    for (let zi = 0; zi < dimZ; zi++) {
+      const srcOffset = zi * dimX;
+      const dstOffset = zi * strideZ + yiOffset;
+      data.set(intensity.subarray(srcOffset, srcOffset + dimX), dstOffset);
+    }
+  }
+  return { data, dimensions: [dimX, dimY, dimZ] };
+}
+
+// ─── Rendu B: windowed volume for temporal playback ────────────────────────
+// Direct pixel stacking (no cone projection). Sliding window of N frames.
+// Layout: data[z * dimY * dimX + y * dimX + x]
+//   X = pixel col (lateral), Y = frame index (window), Z = pixel row (depth)
+
+function buildWindowVolume(
+  allFrames: PreprocessedFrame[],
+  centerIndex: number,
+  windowSize: number,
+): { normalized: Float32Array; dimensions: [number, number, number]; extent: [number, number, number] } {
+  const half = Math.floor(windowSize / 2);
+  const start = Math.max(0, centerIndex - half);
+  const end = Math.min(allFrames.length, start + windowSize);
+  const count = end - start;
+
+  if (count === 0 || allFrames[start].width === 0 || allFrames[start].height === 0) {
+    return { normalized: new Float32Array(1), dimensions: [1, 1, 1], extent: [1, 1, 1] };
+  }
+
+  const dimX = allFrames[start].width;
+  const dimY = count;
+  const dimZ = allFrames[start].height;
+  const strideZ = dimY * dimX;
+
+  const data = new Float32Array(dimX * dimY * dimZ);
+
+  // Row-copy: O(dimY × dimZ) subarray ops instead of O(dimX × dimY × dimZ)
+  for (let yi = 0; yi < dimY; yi++) {
+    const intensity = allFrames[start + yi].intensity;
+    const yiOffset = yi * dimX;
+    for (let zi = 0; zi < dimZ; zi++) {
+      const srcOffset = zi * dimX;
+      const dstOffset = zi * strideZ + yiOffset;
+      data.set(intensity.subarray(srcOffset, srcOffset + dimX), dstOffset);
+    }
+  }
+
+  const aspect = dimX / dimZ;
+  return {
+    normalized: data,
+    dimensions: [dimX, dimY, dimZ],
+    extent: [aspect, 0.5, 1],
+  };
+}
+
+// ─── SVG Icons — isometric camera views ─────────────────────────────────
+const IconFrontal = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3" y="3" width="10" height="10" rx="1.5" />
+    <circle cx="8" cy="8" r="2.5" opacity="0.5" />
+    <line x1="8" y1="3" x2="8" y2="5" opacity="0.35" />
+    <line x1="8" y1="11" x2="8" y2="13" opacity="0.35" />
+    <line x1="3" y1="8" x2="5" y2="8" opacity="0.35" />
+    <line x1="11" y1="8" x2="13" y2="8" opacity="0.35" />
+  </svg>
+);
+const IconHorizontal = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M2 11L5 5H13L10 11H2Z" />
+    <path d="M5 5L2 11" opacity="0.4" />
+    <path d="M13 5L10 11" opacity="0.4" />
+    <circle cx="7.5" cy="8" r="1.5" opacity="0.5" />
+  </svg>
+);
+const IconVertical = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M4 13V5L8 2L12 5V13H4Z" />
+    <line x1="4" y1="5" x2="12" y2="5" opacity="0.3" />
+    <circle cx="8" cy="9" r="1.5" opacity="0.5" />
+  </svg>
+);
+const IconFree = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M8 2L14 5.5V10.5L8 14L2 10.5V5.5L8 2Z" />
+    <path d="M8 2V14" opacity="0.3" />
+    <path d="M2 5.5L14 10.5" opacity="0.2" />
+    <path d="M14 5.5L2 10.5" opacity="0.2" />
+    <circle cx="8" cy="8" r="1.2" fill="currentColor" opacity="0.4" />
+  </svg>
+);
+const IconEdit = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+  </svg>
+);
+const IconClose = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+  </svg>
+);
+const IconChevronDown = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="6 9 12 15 18 9" />
+  </svg>
+);
+
+const CAMERA_PRESETS: { key: CameraPreset; labelKey: string; Icon: React.FC }[] = [
+  { key: 'frontal', labelKey: 'v2.camera.frontal', Icon: IconFrontal },
+  { key: 'horizontal', labelKey: 'v2.camera.horizontal', Icon: IconHorizontal },
+  { key: 'vertical', labelKey: 'v2.camera.vertical', Icon: IconVertical },
+  { key: 'free', labelKey: 'v2.camera.free', Icon: IconFree },
+];
+
+// ─── Leaflet Map component ─────────────────────────────────────────────────
+function GpsMap({ points, theme }: { points?: Array<{ lat: number; lon: number }>; theme: string }) {
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapInstanceRef = useRef<L_Type.Map | null>(null);
+  const leafletRef = useRef<typeof L_Type | null>(null);
+
+  const hasPoints = points && points.length >= 2;
+
+  useEffect(() => {
+    if (!mapContainerRef.current || mapInstanceRef.current) return;
+    let cancelled = false;
+    let resizeTimerId: number | undefined;
+
+    // Lazy-load Leaflet only when the map is actually rendered
+    // (leaflet CSS is statically imported by MapView)
+    (async () => {
+      const L = await import('leaflet').then(m => m.default);
+      if (cancelled) return;
+      leafletRef.current = L;
+
+      const tileUrl = theme === 'light'
+        ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+        : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+
+      const map = L.map(mapContainerRef.current!, {
+        zoomControl: false,
+        attributionControl: false,
+        scrollWheelZoom: false,
+      });
+
+      L.control.zoom({ position: 'topright' }).addTo(map);
+      L.tileLayer(tileUrl, { maxZoom: 19 }).addTo(map);
+
+      if (hasPoints) {
+        const latLngs = points!.map((p) => L.latLng(p.lat, p.lon));
+        const polyline = L.polyline(latLngs, {
+          color: colors.accent,
+          weight: 3,
+          opacity: 0.8,
+          smoothFactor: 1.5,
+        }).addTo(map);
+
+        L.circleMarker(latLngs[0], {
+          radius: 5, color: '#22c55e', fillColor: '#22c55e', fillOpacity: 1, weight: 0,
+        }).addTo(map);
+
+        L.circleMarker(latLngs[latLngs.length - 1], {
+          radius: 5, color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 1, weight: 0,
+        }).addTo(map);
+
+        map.fitBounds(polyline.getBounds(), { padding: [20, 20], maxZoom: 19 });
+      } else {
+        map.setView([20, 0], 2);
+      }
+
+      map.on('click', () => map.scrollWheelZoom.enable());
+      map.on('mouseout', () => map.scrollWheelZoom.disable());
+
+      mapInstanceRef.current = map;
+      resizeTimerId = window.setTimeout(() => map.invalidateSize(), 200);
+    })();
+
+    return () => {
+      cancelled = true;
+      if (resizeTimerId != null) clearTimeout(resizeTimerId);
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.remove();
+        mapInstanceRef.current = null;
+      }
+    };
+  }, [points, theme, hasPoints]);
+
+  // Swap tiles on theme change
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    const L = leafletRef.current;
+    if (!map || !L) return;
+    map.eachLayer((layer) => {
+      if (layer instanceof L.TileLayer) layer.remove();
+    });
+    const tileUrl = theme === 'light'
+      ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+      : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+    L.tileLayer(tileUrl, { maxZoom: 19 }).addTo(map);
+  }, [theme]);
+
+  return (
+    <div
+      ref={mapContainerRef}
+      style={{
+        width: '100%',
+        height: '100%',
+        borderRadius: '16px',
+        overflow: 'hidden',
+      }}
+    />
+  );
+}
+
+// ─── Settings controls (rendered as fragment, parent provides container) ──
+function SettingsControls({
+  settings, cameraPreset, autoThreshold, showGhostSlider,
+  showBeamToggle, showSpeedSlider, playSpeed, chromaticModes,
+  lang, t, onUpdateSetting, onCameraPreset, onAutoThreshold, onPlaySpeed,
+}: {
+  settings: RendererSettings; cameraPreset: CameraPreset;
+  autoThreshold: boolean; showGhostSlider: boolean;
+  showBeamToggle: boolean; showSpeedSlider: boolean;
+  playSpeed: number; chromaticModes: ChromaticMode[];
+  lang: string; t: (key: any) => string;
+  onUpdateSetting: (key: keyof RendererSettings, value: number | boolean | string) => void;
+  onCameraPreset: (preset: CameraPreset) => void;
+  onAutoThreshold: (enabled: boolean) => void;
+  onPlaySpeed: (speed: number) => void;
+}) {
+  return (
+    <>
+      {/* Camera presets */}
+      <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+        {CAMERA_PRESETS.map((p) => (
+          <button
+            key={p.key}
+            onClick={() => onCameraPreset(p.key)}
+            title={t(p.labelKey as TranslationKey)}
+            style={{
+              width: '28px', height: '28px', borderRadius: '8px',
+              border: `1px solid ${cameraPreset === p.key ? colors.accent : colors.border}`,
+              background: cameraPreset === p.key ? colors.accentMuted : colors.surface,
+              color: cameraPreset === p.key ? colors.accent : colors.text3,
+              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              transition: 'all 150ms ease',
+            }}
+          >
+            <p.Icon />
+          </button>
+        ))}
+      </div>
+
+      {/* Sliders */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        <Slider label={t('v2.controls.opacity')} value={settings.opacityScale} min={0.1} max={5.0} step={0.1} onChange={(v: number) => onUpdateSetting('opacityScale', v)} />
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '3px' }}>
+            <span style={{ fontSize: '11px', fontWeight: 500, color: colors.text2 }}>{t('v2.controls.threshold')}</span>
+            <label style={{ fontSize: '10px', color: colors.text3, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <input type="checkbox" checked={autoThreshold} onChange={(e: React.ChangeEvent<HTMLInputElement>) => onAutoThreshold(e.target.checked)} style={{ width: '12px', height: '12px' }} />
+              {t('v2.controls.auto')}
+            </label>
+          </div>
+          <Slider label="" value={settings.threshold} min={0} max={0.5} step={0.01} onChange={(v: number) => { onAutoThreshold(false); onUpdateSetting('threshold', v); }} />
+        </div>
+        <Slider label={t('v2.controls.density')} value={settings.densityScale} min={0.1} max={5.0} step={0.1} onChange={(v: number) => onUpdateSetting('densityScale', v)} />
+        <Slider label={t('v2.controls.smoothing')} value={settings.smoothing} min={0} max={1.0} step={0.05} onChange={(v: number) => onUpdateSetting('smoothing', v)} />
+        <Slider label={t('v2.controls.steps')} value={settings.stepCount} min={64} max={512} step={32} onChange={(v: number) => onUpdateSetting('stepCount', v)} />
+        {showGhostSlider && (
+          <Slider label={t('v2.controls.ghost')} value={settings.ghostEnhancement} min={0} max={3.0} step={0.1} onChange={(v: number) => onUpdateSetting('ghostEnhancement', v)} />
+        )}
+      </div>
+
+      {showBeamToggle && (
+        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: colors.text2, cursor: 'pointer' }}>
+          <input type="checkbox" checked={settings.showBeam} onChange={(e: React.ChangeEvent<HTMLInputElement>) => onUpdateSetting('showBeam', e.target.checked)} />
+          {t('v2.controls.showBeam')}
+        </label>
+      )}
+
+      {showSpeedSlider && (
+        <Slider label={t('v2.controls.playSpeed')} value={playSpeed} min={1} max={30} step={1} onChange={(v: number) => onPlaySpeed(v)} />
+      )}
+    </>
+  );
+}
+
+// ─── Main Component ─────────────────────────────────────────────────────────
+export function VolumeViewer({
+  volumeData,
+  dimensions,
+  extent,
+  spatialData,
+  spatialDimensions,
+  spatialExtent,
+  classicData,
+  classicDimensions,
+  classicExtent,
+  frames,
+  beam,
+  grid,
+  gpxTrack,
+  videoFileName,
+  gpxFileName,
+  videoDurationS,
+  onSettingsChange,
+  onReconfigure,
+  onNewScan,
+  onClose,
+  onPublish,
+  published,
+  publishing,
+  publishError,
+}: VolumeViewerProps) {
+  // Mobile detection — responsive to resize
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)');
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+
+  // Refs for the 3 viewport containers
+  const containerARef = useRef<HTMLDivElement>(null);
+  const containerBRef = useRef<HTMLDivElement>(null);
+  const containerCRef = useRef<HTMLDivElement>(null);
+
+  // ─── Ambient Music ──────────────────────────────────────────────────────
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [musicStarted, setMusicStarted] = useState(false);
+
+  useEffect(() => {
+    const basePath = import.meta.env.BASE_URL ?? '/ecos-data-captured/';
+    const audio = new Audio(`${basePath}audio/ambient.mp3`);
+    audio.loop = true;
+    // PC gets 20% more volume (0.36 vs 0.30 on mobile)
+    const baseVolume = 0.30;
+    const pcBoost = 1.2;
+    audio.volume = isMobile ? baseVolume : baseVolume * pcBoost;
+    // Preload to avoid cutting off on PC
+    audio.preload = 'auto';
+    audioRef.current = audio;
+
+    return () => {
+      audio.pause();
+      audio.src = '';
+      audioRef.current = null;
+    };
+  }, [isMobile]);
+
+  // Start music on first user interaction (required by autoplay policies)
+  useEffect(() => {
+    if (musicStarted) return;
+    const startMusic = () => {
+      if (audioRef.current && !musicStarted) {
+        audioRef.current.play().catch(() => {});
+        setMusicStarted(true);
+      }
+    };
+    document.addEventListener('pointerdown', startMusic, { once: true });
+    document.addEventListener('keydown', startMusic, { once: true });
+    // Also try immediate play (works on mobile more often)
+    if (audioRef.current) {
+      audioRef.current.play().then(() => setMusicStarted(true)).catch(() => {});
+    }
+    return () => {
+      document.removeEventListener('pointerdown', startMusic);
+      document.removeEventListener('keydown', startMusic);
+    };
+  }, [musicStarted]);
+
+  // Renderers
+  const rendererARef = useRef<VolumeRenderer | null>(null);
+  const rendererBRef = useRef<VolumeRenderer | null>(null);
+  const rendererCRef = useRef<VolumeRendererClassic | null>(null);
+  const slicePanelRef = useRef<SlicePanelHandle>(null);
+
+  // Edit mode: which volume is currently being edited (null = none)
+  const [editingMode, setEditingMode] = useState<'instrument' | 'spatial' | 'classic' | null>(null);
+
+  // Per-mode settings — strict hardcoded defaults (Ctrl+S freezes to localStorage)
+  const [modeSettings, setModeSettings] = useState<Record<string, RendererSettings>>({
+    instrument: {
+      ...DEFAULT_RENDERER,
+      opacityScale: 1,
+      threshold: 0.02,
+      densityScale: 1,
+      smoothing: 0.15,
+      showBeam: true,
+      ghostEnhancement: 0,
+      stepCount: 192,
+      chromaticMode: 'sonar-original' as ChromaticMode,
+    },
+    spatial: {
+      ...DEFAULT_RENDERER,
+      opacityScale: 1,
+      threshold: 0,
+      densityScale: 1.2,
+      smoothing: 1,
+      showBeam: false,
+      ghostEnhancement: 3,
+      stepCount: 192,
+      chromaticMode: 'high-contrast' as ChromaticMode,
+    },
+    classic: {
+      ...DEFAULT_RENDERER,
+      opacityScale: 1.7,
+      threshold: 0,
+      densityScale: 1.3,
+      smoothing: 1,
+      showBeam: false,
+      ghostEnhancement: 0,
+      stepCount: 512,
+      chromaticMode: 'sonar-original' as ChromaticMode,
+    },
+  });
+  const [modeCamera, setModeCamera] = useState<Record<string, CameraPreset>>({
+    instrument: 'frontal',
+    spatial: 'horizontal',
+    classic: 'frontal',
+  });
+  const [autoThreshold, setAutoThreshold] = useState(false);
+  const { t, lang } = useTranslation();
+  const { theme } = useTheme();
+
+  // ─── Strict Presentation Position System ────────────────────────────────
+  // Each volume has a saved "presentation pose". In Stage 1, OrbitControls
+  // are fully enabled but after the user releases, the camera smoothly
+  // snaps back to the presentation pose. In Stage 2 (settings), Ctrl+S
+  // saves the current camera position as the new presentation pose.
+
+  type CameraState = { position: [number, number, number]; up: [number, number, number]; target: [number, number, number] };
+
+  const getRenderer = useCallback((mode: string) => {
+    if (mode === 'instrument') return rendererARef.current;
+    if (mode === 'spatial') return rendererBRef.current;
+    if (mode === 'classic') return rendererCRef.current;
+    return null;
+  }, []);
+
+  const presentationPoses = useRef<Record<string, CameraState | null>>({
+    instrument: null, spatial: null, classic: null,
+  });
+
+  const snapBackRefs = useRef<Record<string, { rafId: number | null; timeoutId: number | null }>>({
+    instrument: { rafId: null, timeoutId: null },
+    spatial: { rafId: null, timeoutId: null },
+    classic: { rafId: null, timeoutId: null },
+  });
+
+  const cancelSnapBack = useCallback((mode: string) => {
+    const snap = snapBackRefs.current[mode];
+    if (snap.rafId) { cancelAnimationFrame(snap.rafId); snap.rafId = null; }
+    if (snap.timeoutId) { clearTimeout(snap.timeoutId); snap.timeoutId = null; }
+  }, []);
+
+  const lerp3 = (a: [number, number, number], b: [number, number, number], t: number): [number, number, number] => [
+    a[0] + (b[0] - a[0]) * t,
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+  ];
+
+  const startSnapBack = useCallback((mode: string) => {
+    const renderer = getRenderer(mode);
+    const pose = presentationPoses.current[mode];
+    if (!renderer || !pose) return;
+    const startState = renderer.getCameraState();
+    const vecDist = (p: [number, number, number], t: [number, number, number]) =>
+      Math.sqrt((p[0] - t[0]) ** 2 + (p[1] - t[1]) ** 2 + (p[2] - t[2]) ** 2);
+    const startDist = vecDist(startState.position, startState.target);
+    const targetDist = vecDist(pose.position, pose.target);
+    const totalSteps = 40;
+    let step = 0;
+    const animate = () => {
+      step++;
+      const t = step / totalSteps;
+      const ease = 1 - Math.pow(1 - t, 3);
+      // Lerp target
+      const tgt = lerp3(startState.target, pose.target, ease);
+      // Lerp position
+      const rawPos = lerp3(startState.position, pose.position, ease);
+      // Interpolate distance to restore exact zoom level
+      const interpDist = startDist + (targetDist - startDist) * ease;
+      const dx = rawPos[0] - tgt[0], dy = rawPos[1] - tgt[1], dz = rawPos[2] - tgt[2];
+      const rawDist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      const scale = interpDist / rawDist;
+      const pos: [number, number, number] = [
+        tgt[0] + dx * scale,
+        tgt[1] + dy * scale,
+        tgt[2] + dz * scale,
+      ];
+      renderer.setCameraState({
+        position: pos,
+        up: lerp3(startState.up, pose.up, ease),
+        target: tgt,
+      });
+      if (step < totalSteps) {
+        snapBackRefs.current[mode].rafId = requestAnimationFrame(animate);
+      } else {
+        // Ensure exact final pose (no floating-point drift)
+        renderer.setCameraState(pose);
+        snapBackRefs.current[mode].rafId = null;
+      }
+    };
+    snapBackRefs.current[mode].rafId = requestAnimationFrame(animate);
+  }, [getRenderer]);
+
+  const handleStage1PointerDown = useCallback((mode: string) => {
+    cancelSnapBack(mode);
+  }, [cancelSnapBack]);
+
+  const handleStage1PointerUp = useCallback((mode: string) => {
+    // Wait 400ms for OrbitControls damping to settle, then snap back
+    const snap = snapBackRefs.current[mode];
+    snap.timeoutId = window.setTimeout(() => {
+      snap.timeoutId = null;
+      startSnapBack(mode);
+    }, 400);
+  }, [startSnapBack]);
+
+  // Per-mode calibration configs — strict defaults, each renderer has its OWN calibration
+  const [calibrations, setCalibrations] = useState<Record<string, CalibrationConfig>>({
+    instrument: { ...DEFAULT_CALIBRATION },
+    spatial: { ...DEFAULT_CALIBRATION_B },
+    classic: { ...DEFAULT_CALIBRATION_C },
+  });
+  const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [calibrationSaved, setCalibrationSaved] = useState(false);
+  const [calibrationSaveLabel, setCalibrationSaveLabel] = useState('');
+  const bPressCountRef = useRef(0);
+  const bPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const ORBIT_SPEED = 0.05;
+    const handleKey = (e: KeyboardEvent) => {
+      const activeRenderer = editingMode === 'instrument' ? rendererARef.current
+        : editingMode === 'spatial' ? rendererBRef.current
+        : editingMode === 'classic' ? rendererCRef.current
+        : null;
+
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) && activeRenderer) {
+        e.preventDefault();
+        switch (e.key) {
+          case 'ArrowLeft':  activeRenderer.rotateBy( ORBIT_SPEED, 0); break;
+          case 'ArrowRight': activeRenderer.rotateBy(-ORBIT_SPEED, 0); break;
+          case 'ArrowUp':    activeRenderer.rotateBy(0,  ORBIT_SPEED); break;
+          case 'ArrowDown':  activeRenderer.rotateBy(0, -ORBIT_SPEED); break;
+        }
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+        e.preventDefault();
+        if (editingMode) {
+          // Stage 2: save presentation pose for the active volume
+          const renderer = getRenderer(editingMode);
+          if (renderer) {
+            const state = renderer.getCameraState();
+            presentationPoses.current[editingMode] = state;
+            // pose saved
+          }
+        } else {
+          // Stage 1: snap ALL volumes back to their presentation poses at once
+          (['instrument', 'spatial', 'classic'] as const).forEach((m) => {
+            const renderer = getRenderer(m);
+            if (renderer && presentationPoses.current[m]) {
+              cancelSnapBack(m);
+              startSnapBack(m);
+            }
+          });
+        }
+        // Calibration save — all 3 volumes + base settings
+        if (calibrationOpen) {
+          const names: string[] = [];
+          const cals: Record<string, CalibrationConfig> = {};
+          if (rendererARef.current) {
+            cals.instrument = rendererARef.current.getCalibration();
+            localStorage.setItem('echos-cal-instrument', JSON.stringify(cals.instrument));
+            names.push(t('v2.vol.trace' as TranslationKey));
+          }
+          if (rendererBRef.current) {
+            cals.spatial = rendererBRef.current.getCalibration();
+            localStorage.setItem('echos-cal-spatial', JSON.stringify(cals.spatial));
+            names.push(t('v2.vol.block' as TranslationKey));
+          }
+          if (rendererCRef.current) {
+            cals.classic = rendererCRef.current.getCalibration();
+            localStorage.setItem('echos-cal-classic', JSON.stringify(cals.classic));
+            names.push(t('v2.vol.cone' as TranslationKey));
+          }
+          // Sync React state with renderer state
+          setCalibrations(prev => ({ ...prev, ...cals }));
+          // Save base renderer settings
+          localStorage.setItem('echos-mode-settings', JSON.stringify(modeSettings));
+          // Download combined JSON
+          const combined = {
+            _version: 'echos-calibration-v2',
+            _timestamp: new Date().toISOString(),
+            calibrations: cals,
+            modeSettings,
+          };
+          const blob = new Blob([JSON.stringify(combined, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `echos-calibration-${Date.now()}.json`;
+          a.click();
+          URL.revokeObjectURL(url);
+          setCalibrationSaveLabel(names.join(', '));
+          setCalibrationSaved(true);
+          setTimeout(() => { setCalibrationSaved(false); setCalibrationSaveLabel(''); }, 3000);
+        }
+        return;
+      }
+
+      if (e.key === 'b' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        bPressCountRef.current += 1;
+        if (bPressTimerRef.current) clearTimeout(bPressTimerRef.current);
+        bPressTimerRef.current = setTimeout(() => { bPressCountRef.current = 0; }, 2000);
+        if (bPressCountRef.current >= 5) {
+          bPressCountRef.current = 0;
+          // Only toggle calibration when at least one settings panel is open
+          if (editingMode) {
+            setCalibrationOpen((prev) => !prev);
+          }
+        }
+      }
+
+      if (e.key === 'Escape') {
+        if (calibrationOpen) setCalibrationOpen(false);
+        else if (editingMode) {
+          // Close settings — snap back to exact presentation pose
+          startSnapBack(editingMode);
+          setEditingMode(null);
+        }
+      }
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, [calibrationOpen, editingMode, modeSettings, startSnapBack, cancelSnapBack, getRenderer]);
+
+  // Theme sync + editingMode → update scene bg + scroll zoom
+  // IMPORTANT: only update bg color and zoom, do NOT overwrite calibration with defaults
+  useEffect(() => {
+    const stage1Bg = theme === 'light' ? '#f5f5f7' : '#111111';
+    const stage2Bg = theme === 'light' ? '#FFFFFF' : '#1A1A20';
+    const modes = [
+      { ref: rendererARef, mode: 'instrument' as const },
+      { ref: rendererBRef, mode: 'spatial' as const },
+      { ref: rendererCRef, mode: 'classic' as const },
+    ];
+    modes.forEach(({ ref, mode }) => {
+      if (!ref.current) return;
+      const isExpanded = editingMode === mode;
+      const bgColor = isExpanded ? stage2Bg : stage1Bg;
+      ref.current.setSceneBg(bgColor);
+      ref.current.setScrollZoom(isExpanded);
+      // Only cancel snap-back when entering edit mode (not when leaving)
+      if (isExpanded) cancelSnapBack(mode);
+    });
+  }, [theme, editingMode, cancelSnapBack]);
+
+  const handleCalibrationChange = useCallback((cal: CalibrationConfig) => {
+    if (!editingMode) return;
+    setCalibrations(prev => ({ ...prev, [editingMode]: cal }));
+    setCalibrationSaved(false);
+    // Apply calibration to ACTIVE renderer only
+    getRenderer(editingMode)?.setCalibration(cal);
+  }, [editingMode, getRenderer]);
+
+  // Temporal playback state
+  const hasFrames = !!(frames && frames.length > 0);
+  const hasSpatialData = !!(spatialData && spatialData.length > 0);
+  const hasVolumeData = !!(volumeData && volumeData.length > 0);
+  const hasClassicData = !!(classicData && classicData.length > 0);
+  // Spatial scrub: allow slider/play on Mode B by extracting windows from spatial volume
+  const spatialScrubDims = (!hasFrames && hasSpatialData && spatialDimensions) ? spatialDimensions : null;
+  const spatialFrameCount = spatialScrubDims ? spatialScrubDims[1] : 0;
+  const hasSpatialScrub = spatialFrameCount > WINDOW_SIZE;
+  const [currentFrame, setCurrentFrame] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [playSpeed, setPlaySpeed] = useState(20);
+  const playingRef = useRef(false);
+  const currentFrameRef = useRef(0);
+
+  // Tracé (instrument) position.z slider — controls volume Z position directly
+  const [tracePositionZ, setTracePositionZ] = useState(0);
+  const handleTracePositionZ = useCallback((value: number) => {
+    setTracePositionZ(value);
+    if (rendererARef.current) {
+      const cal = calibrations.instrument;
+      const newCal = { ...cal, position: { ...cal.position, z: value } };
+      setCalibrations(prev => ({ ...prev, instrument: newCal }));
+      rendererARef.current.setCalibration(newCal);
+    }
+  }, [calibrations.instrument]);
+
+  // Slice data
+  const [sliceVolumeData, setSliceVolumeData] = useState<Float32Array | null>(null);
+  const [sliceDimensions, setSliceDimensions] = useState<[number, number, number]>([1, 1, 1]);
+
+  const fullSliceVolume = useMemo(() => {
+    if (!frames || frames.length === 0) return null;
+    return buildSliceVolumeFromFrames(frames);
+  }, [frames]);
+
+  // ─── Initialize 3 renderers — strict defaults, no localStorage ──────────
+  useEffect(() => {
+    const bgColor = theme === 'light' ? '#f5f5f7' : '#111111';
+
+    // Mobile speed multiplier — reduced max speed on mobile
+    const mobileSpeedMul = isMobile ? 0.15 : 1;
+
+    try {
+      // Mode A — VolumeRenderer + DEFAULT_CALIBRATION
+      // DO NOT call setCameraPreset after construction — constructor already applies orbit from calibration
+      if (containerARef.current && !rendererARef.current) {
+        rendererARef.current = new VolumeRenderer(
+          containerARef.current, modeSettings.instrument, { ...DEFAULT_CALIBRATION, bgColor },
+        );
+        rendererARef.current.setGridAxesVisible(false);
+        rendererARef.current.setScrollZoom(false);
+        if (isMobile) rendererARef.current.setRotateSpeed(0.3 * mobileSpeedMul);
+      }
+
+      // Mode B — VolumeRenderer + DEFAULT_CALIBRATION_B
+      if (containerBRef.current && !rendererBRef.current && (hasFrames || hasSpatialData)) {
+        rendererBRef.current = new VolumeRenderer(
+          containerBRef.current, modeSettings.spatial, { ...DEFAULT_CALIBRATION_B, bgColor },
+        );
+        rendererBRef.current.setGridAxesVisible(false);
+        rendererBRef.current.setScrollZoom(false);
+        if (isMobile) rendererBRef.current.setRotateSpeed(0.3 * mobileSpeedMul);
+      }
+
+      // Mode C — VolumeRendererClassic + DEFAULT_CALIBRATION_C
+      if (containerCRef.current && !rendererCRef.current && (hasFrames || hasClassicData || hasVolumeData)) {
+        rendererCRef.current = new VolumeRendererClassic(
+          containerCRef.current, modeSettings.classic, { ...DEFAULT_CALIBRATION_C, bgColor },
+        );
+        rendererCRef.current.setGridAxesVisible(false);
+        rendererCRef.current.setScrollZoom(false);
+        if (isMobile) rendererCRef.current.setRotateSpeed(0.3 * mobileSpeedMul);
+      }
+    } catch (err) {
+      console.error('[VolumeViewer] Failed to create WebGL renderers:', err);
+    }
+
+    return () => {
+      // Clean up snap-back animations and timeouts
+      (['instrument', 'spatial', 'classic'] as const).forEach((m) => {
+        const snap = snapBackRefs.current[m];
+        if (snap.rafId) cancelAnimationFrame(snap.rafId);
+        if (snap.timeoutId) clearTimeout(snap.timeoutId);
+      });
+      rendererARef.current?.dispose(); rendererARef.current = null;
+      rendererBRef.current?.dispose(); rendererBRef.current = null;
+      rendererCRef.current?.dispose(); rendererCRef.current = null;
+      // Clear volume caches to free Float32Array memory
+      frameCacheBRef.current.clear();
+      frameCacheCRef.current.clear();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasFrames, hasSpatialData, hasVolumeData, hasClassicData]);
+
+  // Initialize presentation poses after renderers are created
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      (['instrument', 'spatial', 'classic'] as const).forEach((mode) => {
+        const renderer = getRenderer(mode);
+        if (renderer && !presentationPoses.current[mode]) {
+          presentationPoses.current[mode] = renderer.getCameraState();
+        }
+      });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [hasFrames, getRenderer]);
+
+  // Toggle grid/axes visibility based on edit mode
+  useEffect(() => {
+    rendererARef.current?.setGridAxesVisible(editingMode === 'instrument');
+    rendererBRef.current?.setGridAxesVisible(editingMode === 'spatial');
+    rendererCRef.current?.setGridAxesVisible(editingMode === 'classic');
+  }, [editingMode]);
+
+  // Upload beam wireframe
+  useEffect(() => {
+    if (!beam) return;
+    rendererARef.current?.updateBeamGeometry(beam.beamAngleDeg / 2, beam.depthMaxM);
+  }, [beam]);
+
+  // Upload Mode A data
+  useEffect(() => {
+    if (!rendererARef.current || !volumeData || volumeData.length === 0) return;
+    try {
+      rendererARef.current.uploadVolume(volumeData, dimensions, extent);
+      if (autoThreshold) {
+        const threshold = computeAutoThreshold(volumeData, 85);
+        setModeSettings((prev) => ({ ...prev, instrument: { ...prev.instrument, threshold } }));
+        rendererARef.current?.updateSettings({ threshold });
+      }
+    } catch (err) {
+      console.error('[VolumeViewer] Mode A upload error:', err);
+    }
+  }, [volumeData, dimensions, extent]);
+
+  // Upload pre-computed spatial data to Mode B (for pre-generated sessions without frames)
+  // With spatial scrub: extract a WINDOW_SIZE window to match ScanPage's default view
+  useEffect(() => {
+    if (!rendererBRef.current || !spatialData || spatialData.length === 0 || hasFrames) return;
+    try {
+      const sDims = spatialDimensions ?? dimensions;
+      if (hasSpatialScrub) {
+        // Extract initial 12-frame window (same as ScanPage Mode B default)
+        const win = extractSpatialWindow(spatialData, sDims, currentFrame, WINDOW_SIZE);
+        rendererBRef.current.uploadVolume(win.data, win.dimensions, win.extent);
+      } else {
+        const sExt = spatialExtent ?? extent;
+        rendererBRef.current.uploadVolume(spatialData, sDims, sExt);
+      }
+    } catch (err) {
+      console.error('[VolumeViewer] Mode B upload error:', err);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spatialData, spatialDimensions, spatialExtent, dimensions, extent, hasFrames, hasSpatialScrub]);
+
+  // Upload pre-computed volume data to Mode C (for pre-generated sessions without frames)
+  // Prefer classicData (proper cone projection) over volumeData (instrument volume)
+  useEffect(() => {
+    if (!rendererCRef.current || hasFrames) return;
+    const cData = hasClassicData ? classicData! : volumeData;
+    const cDims = hasClassicData ? (classicDimensions ?? dimensions) : dimensions;
+    const cExt = hasClassicData ? (classicExtent ?? extent) : extent;
+    if (!cData || cData.length === 0) return;
+    try {
+      rendererCRef.current.uploadVolume(cData, cDims, cExt);
+    } catch (err) {
+      console.error('[VolumeViewer] Mode C upload error:', err);
+    }
+  }, [classicData, classicDimensions, classicExtent, volumeData, dimensions, extent, hasFrames, hasClassicData]);
+
+  // ─── Mode B + C: frame caches (LRU-bounded) ────────────────────────────
+  const MAX_CACHE_ENTRIES = 20;
+  const frameCacheBRef = useRef<Map<number, { normalized: Float32Array; dimensions: [number, number, number]; extent: [number, number, number] }>>(new Map());
+  const frameCacheCRef = useRef<Map<number, { normalized: Float32Array; dimensions: [number, number, number]; extent: [number, number, number] }>>(new Map());
+
+  // Pre-allocated Float32Array buffer for buildWindowVolume (avoids 1.4MB alloc per frame)
+  const windowBufRef = useRef<{ buf: Float32Array; size: number }>({ buf: new Float32Array(0), size: 0 });
+
+  // Refs that track latest props for use in the RAF loop (avoids stale closures)
+  const framesRef = useRef(frames);
+  framesRef.current = frames;
+  const beamRef = useRef(beam);
+  beamRef.current = beam;
+  const gridRef = useRef(grid);
+  gridRef.current = grid;
+
+  /** Build window volume into a pre-allocated Float32Array (for direct GPU upload, NOT for caching) */
+  const buildWindowVolumePooled = useCallback((
+    allFrames: PreprocessedFrame[],
+    centerIndex: number,
+    windowSize: number,
+  ): { normalized: Float32Array; dimensions: [number, number, number]; extent: [number, number, number] } => {
+    const half = Math.floor(windowSize / 2);
+    const start = Math.max(0, centerIndex - half);
+    const end = Math.min(allFrames.length, start + windowSize);
+    const count = end - start;
+
+    if (count === 0 || allFrames[start].width === 0 || allFrames[start].height === 0) {
+      return { normalized: new Float32Array(1), dimensions: [1, 1, 1], extent: [1, 1, 1] };
+    }
+
+    const dimX = allFrames[start].width;
+    const dimY = count;
+    const dimZ = allFrames[start].height;
+    const totalSize = dimX * dimY * dimZ;
+    const strideZ = dimY * dimX;
+
+    // Reuse pre-allocated buffer if large enough, otherwise grow it
+    if (windowBufRef.current.size < totalSize) {
+      windowBufRef.current = { buf: new Float32Array(totalSize), size: totalSize };
+    }
+    const data = windowBufRef.current.buf;
+
+    // Row-copy: O(dimY * dimZ) subarray ops instead of O(dimX * dimY * dimZ) pixel ops
+    for (let yi = 0; yi < dimY; yi++) {
+      const intensity = allFrames[start + yi].intensity;
+      const yiOffset = yi * dimX;
+      for (let zi = 0; zi < dimZ; zi++) {
+        const srcOffset = zi * dimX;
+        const dstOffset = zi * strideZ + yiOffset;
+        data.set(intensity.subarray(srcOffset, srcOffset + dimX), dstOffset);
+      }
+    }
+
+    const aspect = dimX / dimZ;
+    return {
+      normalized: totalSize === windowBufRef.current.size ? data : data.subarray(0, totalSize),
+      dimensions: [dimX, dimY, dimZ],
+      extent: [aspect, 0.5, 1],
+    };
+  }, []);
+
+  /** Upload frame data to both B and C renderers for a given frame index */
+  const uploadFrameToRenderers = useCallback((frameIdx: number) => {
+    const frms = framesRef.current;
+    if (!frms || frms.length === 0) return;
+
+    try {
+      // Mode B upload
+      if (rendererBRef.current) {
+        const cacheB = frameCacheBRef.current;
+        const cachedB = cacheB.get(frameIdx);
+        if (cachedB) {
+          // Use cached (already cloned) data
+          rendererBRef.current.uploadVolume(cachedB.normalized, cachedB.dimensions, cachedB.extent);
+        } else {
+          // Build into pooled buffer → upload directly to GPU → do NOT cache pooled ref
+          const volB = buildWindowVolumePooled(frms, frameIdx, WINDOW_SIZE);
+          rendererBRef.current.uploadVolume(volB.normalized, volB.dimensions, volB.extent);
+        }
+      }
+
+      // Mode C upload
+      const bm = beamRef.current;
+      const gd = gridRef.current;
+      if (rendererCRef.current && bm && gd) {
+        const cacheC = frameCacheCRef.current;
+        const cachedC = cacheC.get(frameIdx);
+        if (cachedC) {
+          rendererCRef.current.uploadVolume(cachedC.normalized, cachedC.dimensions, cachedC.extent);
+        } else {
+          // projectFrameWindow allocates its own array — safe to cache
+          const volC = projectFrameWindow(frms, frameIdx, WINDOW_SIZE, bm, gd);
+          cacheC.set(frameIdx, volC);
+          rendererCRef.current.uploadVolume(volC.normalized, volC.dimensions, volC.extent);
+        }
+      }
+    } catch (err) {
+      console.error('[VolumeViewer] Frame upload error:', err);
+    }
+  }, [buildWindowVolumePooled]);
+
+  /** Evict stale cache entries around a given frame index */
+  const evictCaches = useCallback((frameIdx: number) => {
+    const lookAhead = 8;
+    const minKeep = Math.max(0, frameIdx - 2);
+    const maxKeep = frameIdx + lookAhead;
+    for (const cache of [frameCacheBRef.current, frameCacheCRef.current]) {
+      for (const key of cache.keys()) {
+        if (key < minKeep || key > maxKeep) cache.delete(key);
+      }
+      if (cache.size > MAX_CACHE_ENTRIES) {
+        const keys = [...cache.keys()].sort((a, b) => a - b);
+        while (cache.size > MAX_CACHE_ENTRIES) {
+          cache.delete(keys.shift()!);
+        }
+      }
+    }
+  }, []);
+
+  // Prefetch ahead of current frame — ONLY when NOT playing (slider interaction / initial load).
+  // During playback, volumes are built on-the-fly via pooled buffer to avoid CPU contention.
+  useEffect(() => {
+    if (!hasFrames || !frames || frames.length === 0 || playing) return;
+    let cancelled = false;
+    const lookAhead = 8;
+
+    (async () => {
+      // Prefetch Mode B (uses optimized row-copy buildWindowVolume)
+      const cacheB = frameCacheBRef.current;
+      for (let offset = 0; offset <= lookAhead && !cancelled; offset++) {
+        const idx = currentFrame + offset;
+        if (idx >= frames.length || cacheB.has(idx)) continue;
+        cacheB.set(idx, buildWindowVolume(frames, idx, WINDOW_SIZE));
+        // Yield to main thread every 2 frames to avoid jank
+        if (offset % 2 === 1) await new Promise((r) => setTimeout(r, 0));
+      }
+
+      // Prefetch Mode C
+      if (beam && grid) {
+        const cacheC = frameCacheCRef.current;
+        for (let offset = 0; offset <= lookAhead && !cancelled; offset++) {
+          const idx = currentFrame + offset;
+          if (idx >= frames.length || cacheC.has(idx)) continue;
+          cacheC.set(idx, projectFrameWindow(frames, idx, WINDOW_SIZE, beam, grid));
+          // Yield more often — projectFrameWindow is heavy
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      if (!cancelled) evictCaches(currentFrame);
+    })();
+
+    return () => { cancelled = true; };
+  }, [currentFrame, frames, hasFrames, beam, grid, playing, evictCaches]);
+
+  // Upload when currentFrame changes (slider interaction or initial load).
+  // Skip during playback — the RAF loop uploads directly.
+  useEffect(() => {
+    if (playing) return;
+    if (hasFrames) {
+      uploadFrameToRenderers(currentFrame);
+    } else if (hasSpatialScrub && rendererBRef.current && spatialData) {
+      // Spatial scrub: extract window from spatial volume for Mode B
+      const sDims = spatialDimensions ?? dimensions;
+      const win = extractSpatialWindow(spatialData, sDims, currentFrame, WINDOW_SIZE);
+      rendererBRef.current.uploadVolume(win.data, win.dimensions, win.extent);
+    }
+  }, [currentFrame, hasFrames, playing, uploadFrameToRenderers, hasSpatialScrub, spatialData, spatialDimensions, dimensions]);
+
+  // Slice data — prefer frame-stacked volume, then spatialData (highest res stacked frames), then instrument
+  // spatialData is the downsampled frame-stack (same structure as fullSliceVolume, just lower res)
+  // so it gives the most accurate slices for pre-generated sessions
+  useEffect(() => {
+    if (fullSliceVolume) {
+      setSliceVolumeData(fullSliceVolume.data);
+      setSliceDimensions(fullSliceVolume.dimensions);
+    } else if (spatialData && spatialData.length > 0 && spatialDimensions) {
+      setSliceVolumeData(spatialData);
+      setSliceDimensions(spatialDimensions);
+    } else if (volumeData && volumeData.length > 0) {
+      setSliceVolumeData(volumeData);
+      setSliceDimensions(dimensions);
+    }
+  }, [fullSliceVolume, spatialData, spatialDimensions, volumeData, dimensions]);
+
+  // ─── Playback loop — RAF-driven, uploads directly to renderers ──────────
+  // Uses requestAnimationFrame for vsync-aligned smooth playback.
+  // Frame timing is controlled by playSpeed (elapsed time gating).
+  // Mode B is updated every frame; Mode C is throttled to every Nth frame.
+  // React state syncs every frame for smooth slider tracking.
+  //
+  // Also supports spatial scrub: when no frames but spatialData exists,
+  // extracts WINDOW_SIZE windows from the spatial volume for Mode B playback.
+  const canPlay = hasFrames || hasSpatialScrub;
+
+  useEffect(() => {
+    if (!canPlay || !playing) return;
+    playingRef.current = true;
+    currentFrameRef.current = currentFrame;
+    const intervalMs = 1000 / playSpeed;
+    const MODE_C_EVERY = 1;
+    let frameCounter = 0;
+    let lastFrameTime = 0;
+    let rafId: number;
+
+    const maxFrame = hasFrames
+      ? (framesRef.current?.length ?? 1) - 1
+      : spatialFrameCount - 1;
+
+    const tick = (timestamp: number) => {
+      if (!playingRef.current) return;
+
+      // Gating: only advance when enough time has elapsed
+      if (lastFrameTime === 0) { lastFrameTime = timestamp; rafId = requestAnimationFrame(tick); return; }
+      if (timestamp - lastFrameTime < intervalMs) { rafId = requestAnimationFrame(tick); return; }
+      lastFrameTime = timestamp;
+
+      const next = currentFrameRef.current + 1;
+      if (next >= maxFrame) {
+        setCurrentFrame(currentFrameRef.current);
+        setPlaying(false);
+        return;
+      }
+      currentFrameRef.current = next;
+      frameCounter++;
+
+      try {
+        if (hasFrames) {
+          const frms = framesRef.current;
+          if (!frms || frms.length === 0) { rafId = requestAnimationFrame(tick); return; }
+
+          // Mode B: always upload (fast — pooled buffer + FAST PATH GPU upload)
+          if (rendererBRef.current) {
+            const volB = buildWindowVolumePooled(frms, next, WINDOW_SIZE);
+            rendererBRef.current.uploadVolume(volB.normalized, volB.dimensions, volB.extent);
+          }
+
+          // Mode C: only update every Nth frame (projectFrameWindow is heavy)
+          const bm = beamRef.current;
+          const gd = gridRef.current;
+          if (rendererCRef.current && bm && gd && frameCounter % MODE_C_EVERY === 0) {
+            const cacheC = frameCacheCRef.current;
+            const cachedC = cacheC.get(next);
+            if (cachedC) {
+              rendererCRef.current.uploadVolume(cachedC.normalized, cachedC.dimensions, cachedC.extent);
+            } else {
+              const volC = projectFrameWindow(frms, next, WINDOW_SIZE, bm, gd);
+              cacheC.set(next, volC);
+              rendererCRef.current.uploadVolume(volC.normalized, volC.dimensions, volC.extent);
+            }
+          }
+        } else if (hasSpatialScrub && spatialData && spatialScrubDims) {
+          // Spatial scrub: extract window from spatial volume for Mode B
+          if (rendererBRef.current) {
+            const win = extractSpatialWindow(spatialData, spatialScrubDims, next, WINDOW_SIZE);
+            rendererBRef.current.uploadVolume(win.data, win.dimensions, win.extent);
+          }
+          // Mode C stays static (no dynamic cone projection without real frames)
+        }
+      } catch (err) {
+        console.error('[VolumeViewer] Playback upload error:', err);
+      }
+
+      // Throttle React state sync to ~15fps
+      if (frameCounter % 4 === 0 || next >= maxFrame - 1) {
+        setCurrentFrame(next);
+      }
+
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      playingRef.current = false;
+      cancelAnimationFrame(rafId);
+      setCurrentFrame(currentFrameRef.current);
+    };
+  }, [playing, playSpeed, hasFrames, canPlay, hasSpatialScrub, spatialData, spatialScrubDims, spatialFrameCount, buildWindowVolumePooled]);
+
+  // Settings update — per-mode
+  const updateSetting = useCallback(
+    (key: keyof RendererSettings, value: number | boolean | string) => {
+      if (!editingMode) return;
+      setModeSettings((prev) => {
+        const modeKey = editingMode;
+        const next = { ...prev, [modeKey]: { ...prev[modeKey], [key]: value } };
+        if (modeKey === 'instrument') rendererARef.current?.updateSettings({ [key]: value });
+        else if (modeKey === 'spatial') rendererBRef.current?.updateSettings({ [key]: value });
+        else if (modeKey === 'classic') rendererCRef.current?.updateSettings({ [key]: value });
+        onSettingsChange?.(next[modeKey]);
+        return next;
+      });
+    },
+    [onSettingsChange, editingMode],
+  );
+
+  const handleCameraPreset = useCallback((preset: CameraPreset) => {
+    if (!editingMode) return;
+    setModeCamera((prev) => ({ ...prev, [editingMode]: preset }));
+    if (editingMode === 'instrument') rendererARef.current?.setCameraPreset(preset);
+    else if (editingMode === 'spatial') rendererBRef.current?.setCameraPreset(preset);
+    else if (editingMode === 'classic') rendererCRef.current?.setCameraPreset(preset);
+  }, [editingMode]);
+
+  const handleAutoThreshold = useCallback((enabled: boolean) => {
+    setAutoThreshold(enabled);
+    if (enabled && sliceVolumeData && sliceVolumeData.length > 0) {
+      const threshold = computeAutoThreshold(sliceVolumeData, 85);
+      updateSetting('threshold', threshold);
+    }
+  }, [sliceVolumeData, updateSetting]);
+
+  const handleChromaticChange = useCallback((mode: string, chromaticMode: ChromaticMode) => {
+    setModeSettings((prev) => {
+      const next = { ...prev, [mode]: { ...prev[mode], chromaticMode } };
+      if (mode === 'instrument') rendererARef.current?.updateSettings({ chromaticMode });
+      else if (mode === 'spatial') rendererBRef.current?.updateSettings({ chromaticMode });
+      else if (mode === 'classic') rendererCRef.current?.updateSettings({ chromaticMode });
+      return next;
+    });
+  }, []);
+
+  const handleCaptureScreenshot = useCallback(() => {
+    return rendererARef.current?.captureScreenshot() ?? null;
+  }, []);
+
+  // ─── Individual PNG exports: one file per render at max quality ──────
+  const handleCaptureAllPng = useCallback(async () => {
+    const RES = 1920; // High-res capture size for 3D renderers
+
+    const downloadDataUrl = (dataUrl: string, filename: string) => {
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = filename;
+      a.click();
+    };
+
+    // Export each 3D renderer individually
+    if (rendererARef.current) {
+      const url = rendererARef.current.captureHighRes(RES, RES);
+      if (url) downloadDataUrl(url, 'echos_instrument.png');
+    }
+    if (rendererBRef.current) {
+      const url = rendererBRef.current.captureHighRes(RES, RES);
+      if (url) downloadDataUrl(url, 'echos_spatial.png');
+    }
+    if (rendererCRef.current) {
+      const url = rendererCRef.current.captureHighRes(RES, RES);
+      if (url) downloadDataUrl(url, 'echos_classic.png');
+    }
+
+    // Export each slice canvas individually (native resolution = max quality)
+    const sliceData = slicePanelRef.current?.captureSlices();
+    if (sliceData?.crossSection) {
+      downloadDataUrl(sliceData.crossSection, 'echos_coupe_transversale.png');
+    }
+    if (sliceData?.longitudinal) {
+      downloadDataUrl(sliceData.longitudinal, 'echos_coupe_longitudinale.png');
+    }
+  }, []);
+
+  const chromaticModes = getChromaticModes();
+  const totalFrames = hasFrames ? (frames?.length ?? 0) : spatialFrameCount;
+  const currentTimeS = hasFrames && frames!.length > 0 ? frames![currentFrame]?.timeS ?? 0 : 0;
+
+  const showB = hasFrames || hasSpatialData;
+  const showC = (hasFrames || hasClassicData || hasVolumeData) && !!beam && !!grid;
+
+  // Background matches the renderer scene background for seamless 3D
+  const viewportBg = theme === 'light' ? '#f5f5f7' : '#111111';
+  // Stage 2 bg matches the settings panel (GlassPanel / colors.surface)
+  const viewportBgEditing = theme === 'light' ? '#FFFFFF' : '#1A1A20';
+
+  // ─── Render a single volume section (Two-Stage Grid UI) ─────────────
+  const volumeHeight = 'clamp(440px, 62vh, 680px)';
+
+  const renderVolumeSection = (
+    mode: 'instrument' | 'spatial' | 'classic',
+    containerRef: React.RefObject<HTMLDivElement>,
+    title: string,
+    subtitle: string,
+    sectionIndex: number,
+  ) => {
+    const isExpanded = editingMode === mode;
+    const volumeOnLeft = sectionIndex % 2 === 0;
+    const isTemporal = mode === 'classic' || mode === 'spatial';
+    const settings = modeSettings[mode];
+
+    // Slider spacing: equal gap from volume→slider and slider→play
+    const sliderGap = 0; // px from volume bottom to slider (tight)
+    const sliderPlayGap = 12; // px between slider and play
+
+    return (
+      <section key={mode} style={{ marginBottom: '80px' }}>
+        {/* ── 4-column grid: 3/4 volume + 1/4 title/settings ───── */}
+        <div className="echos-quad-grid" style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(4, 1fr)',
+          gap: '24px',
+          gridTemplateRows: `${volumeHeight} auto`,
+        }}>
+          {/* ── Volume viewport: 3 columns, row 1 ──────────────── */}
+          <div
+            ref={containerRef}
+            onPointerDown={() => { if (!isExpanded) handleStage1PointerDown(mode); }}
+            onPointerUp={() => { if (!isExpanded) handleStage1PointerUp(mode); }}
+            style={{
+              gridColumn: volumeOnLeft ? '1 / 4' : '2 / 5',
+              gridRow: '1',
+              width: '100%',
+              height: '100%',
+              minWidth: 0,
+              borderRadius: '16px',
+              overflow: 'hidden',
+              background: isExpanded ? viewportBgEditing : viewportBg,
+              cursor: 'grab',
+              transition: 'box-shadow 400ms ease, background 400ms ease, border-color 400ms ease',
+              border: `1.5px solid ${isExpanded ? colors.accent : colors.border}`,
+              boxShadow: isExpanded
+                ? `0 8px 32px rgba(0,0,0,0.2)`
+                : theme === 'light'
+                  ? '0 2px 20px rgba(0,0,0,0.06)'
+                  : '0 2px 20px rgba(0,0,0,0.3)',
+            }}
+          />
+
+          {/* ── Slider + Play — row 2, under volume columns ── */}
+          <div style={{
+            gridColumn: volumeOnLeft ? '1 / 4' : '2 / 5',
+            gridRow: '2',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            paddingTop: `${sliderGap}px`,
+          }}>
+            {mode === 'instrument' ? (
+              /* Tracé: position.z slider — left=0.75, right=-0.75, center=0 */
+              <>
+                <div style={{
+                  width: 'max(280px, 44%)',
+                  padding: '10px 18px',
+                  background: colors.surface,
+                  borderRadius: '24px',
+                  border: `1px solid ${colors.border}`,
+                  backdropFilter: 'blur(12px)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '10px',
+                }}>
+                  <input
+                    type="range"
+                    min={-0.75}
+                    max={0.75}
+                    step={0.01}
+                    value={-tracePositionZ}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                      handleTracePositionZ(-parseFloat(e.target.value));
+                    }}
+                    style={{ flex: 1, accentColor: colors.accent, cursor: 'pointer', height: '6px' }}
+                  />
+                </div>
+                {/* Invisible spacer — matches play button + gap height for equal section spacing */}
+                <div style={{ height: `${sliderPlayGap + 56}px` }} />
+              </>
+            ) : (hasFrames || hasSpatialScrub) ? (
+              /* Temporal slider + play: frames OR spatial scrub */
+              <>
+                <div style={{
+                  width: 'max(280px, 44%)',
+                  padding: '10px 18px',
+                  background: colors.surface,
+                  borderRadius: '24px',
+                  border: `1px solid ${colors.border}`,
+                  backdropFilter: 'blur(12px)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '10px',
+                }}>
+                  <input
+                    type="range"
+                    min={0}
+                    max={totalFrames - 1}
+                    value={currentFrame}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                      setPlaying(false);
+                      const val = Number(e.target.value);
+                      currentFrameRef.current = val;
+                      setCurrentFrame(val);
+                    }}
+                    style={{ flex: 1, accentColor: colors.accent, cursor: 'pointer', height: '6px' }}
+                  />
+                </div>
+
+                <div style={{ height: `${sliderPlayGap}px` }} />
+
+                <button
+                  onClick={() => {
+                    if (currentFrame >= totalFrames - 1) {
+                      currentFrameRef.current = 0;
+                      setCurrentFrame(0);
+                    }
+                    setPlaying((p) => !p);
+                  }}
+                  style={{
+                    width: '56px', height: '56px', borderRadius: '50%',
+                    border: `1.5px solid ${colors.accent}`,
+                    background: playing ? colors.accentMuted : colors.surface,
+                    color: colors.accent,
+                    cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    transition: 'all 150ms ease',
+                  }}
+                >
+                  {playing ? (
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="4" y="3" width="6" height="18" rx="1.5" />
+                      <rect x="14" y="3" width="6" height="18" rx="1.5" />
+                    </svg>
+                  ) : (
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" style={{ marginLeft: '2px' }}>
+                      <path d="M6 4l15 8-15 8V4z" />
+                    </svg>
+                  )}
+                </button>
+              </>
+            ) : (
+              /* Static pre-computed volume (Mode C without frames): spacer only */
+              <div style={{ height: `${sliderPlayGap + 56}px` }} />
+            )}
+          </div>
+
+          {/* ── Settings column: 1 column, row 1 — TOP and BOTTOM aligned to volume ── */}
+          <div style={{
+            gridColumn: volumeOnLeft ? '4' : '1',
+            gridRow: '1',
+            alignSelf: 'stretch',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '10px',
+            minWidth: 0,
+            overflow: 'hidden',
+          }}>
+            {/* Title row: title (left) + number + chevron/close (right) */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <h2 style={{
+                  margin: 0,
+                  fontFamily: fonts.display,
+                  fontVariationSettings: "'wght' 600",
+                  fontSize: 'clamp(26px, 2.5vw, 40px)',
+                  color: colors.text1,
+                  letterSpacing: '-0.02em',
+                  lineHeight: 1.1,
+                }}>
+                  <span style={{ color: colors.accent, fontSize: '0.7em', marginRight: '6px', position: 'relative', top: '-0.35em' }}>"</span>{title}<span style={{ color: colors.accent, fontSize: '0.7em', marginLeft: '6px', position: 'relative', top: '-0.35em' }}>"</span>
+                </h2>
+                <p style={{
+                  margin: '2px 0 0',
+                  fontSize: '13px',
+                  color: colors.text3,
+                  lineHeight: 1.3,
+                }}>
+                  {subtitle}
+                </p>
+              </div>
+              {/* Section number */}
+              <div style={{
+                width: '44px', height: '44px', minWidth: '44px',
+                borderRadius: '50%',
+                border: `2px solid ${colors.accent}`,
+                background: 'transparent',
+                color: colors.accent,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: '15px', fontWeight: 600,
+                flexShrink: 0,
+                paddingTop: '2px',
+              }}>
+                {String(sectionIndex + 1).padStart(2, '0')}
+              </div>
+              {/* Chevron (settings toggle) or X (calibration close) */}
+              {isExpanded && calibrationOpen ? (
+                <button
+                  onClick={() => setCalibrationOpen(false)}
+                  style={{
+                    width: '48px', height: '48px', minWidth: '48px',
+                    borderRadius: '50%',
+                    border: `1.5px solid ${colors.accent}`,
+                    background: colors.accentMuted,
+                    color: colors.accent,
+                    cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    transition: 'all 200ms ease',
+                    flexShrink: 0,
+                  }}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    if (isExpanded) {
+                      // Closing settings — snap back to exact presentation pose
+                      startSnapBack(mode);
+                      setEditingMode(null);
+                    } else {
+                      cancelSnapBack(mode);
+                      setEditingMode(mode);
+                    }
+                  }}
+                  style={{
+                    width: '48px', height: '48px', minWidth: '48px',
+                    borderRadius: '50%',
+                    border: `1.5px solid ${isExpanded ? colors.accent : colors.border}`,
+                    background: isExpanded ? colors.accentMuted : colors.surface,
+                    color: isExpanded ? colors.accent : colors.text2,
+                    cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    transform: isExpanded ? 'rotate(180deg)' : 'none',
+                    transition: 'all 200ms ease',
+                    flexShrink: 0,
+                  }}
+                >
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginTop: '2px' }}>
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
+              )}
+            </div>
+
+            {/* Chromatic pills */}
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              {chromaticModes.map((m: ChromaticMode) => (
+                <button
+                  key={m}
+                  onClick={() => handleChromaticChange(mode, m)}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: '9999px',
+                    border: `1px solid ${settings.chromaticMode === m ? colors.accent : 'transparent'}`,
+                    background: settings.chromaticMode === m ? colors.accentMuted : colors.surface,
+                    color: settings.chromaticMode === m ? colors.accent : colors.text1,
+                    fontSize: '11px',
+                    fontWeight: 500,
+                    cursor: 'pointer',
+                    fontFamily: 'inherit',
+                    transition: 'all 150ms ease',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {CHROMATIC_LABELS[m][lang as 'en' | 'fr'] || CHROMATIC_LABELS[m].en}
+                </button>
+              ))}
+            </div>
+
+            {/* Settings or Calibration panel — flex:1 fills remaining height to align bottom with volume */}
+            {isExpanded && (
+              <GlassPanel className="echos-controls-panel" style={{
+                padding: '14px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+                flex: 1,
+                minHeight: 0,
+                overflowY: 'auto',
+                borderRadius: '16px',
+                backdropFilter: 'blur(24px)',
+                animation: 'echos-fade-in 200ms ease',
+              }}>
+                {calibrationOpen ? (
+                  <CalibrationPanel
+                    config={calibrations[mode]}
+                    onChange={handleCalibrationChange}
+                    onClose={() => setCalibrationOpen(false)}
+                    saved={calibrationSaved}
+                    saveLabel={calibrationSaveLabel}
+                  />
+                ) : (
+                  <SettingsControls
+                    settings={modeSettings[mode]}
+                    cameraPreset={modeCamera[mode]}
+                    autoThreshold={autoThreshold}
+                    showGhostSlider={mode === 'spatial' || mode === 'classic'}
+                    showBeamToggle={mode === 'instrument'}
+                    showSpeedSlider={false}
+                    playSpeed={playSpeed}
+                    chromaticModes={chromaticModes}
+                    lang={lang}
+                    t={t}
+                    onUpdateSetting={updateSetting}
+                    onCameraPreset={handleCameraPreset}
+                    onAutoThreshold={handleAutoThreshold}
+                    onPlaySpeed={setPlaySpeed}
+                  />
+                )}
+              </GlassPanel>
+            )}
+          </div>
+        </div>
+      </section>
+    );
+  };
+
+  // Generate YZ slice thumbnail — same colorMap as SlicePanel "Water Off"
+  const WATER_OFF_MAP = [
+    [0.0, 0, 0, 0, 0], [0.15, 0, 0, 0, 0], [0.3, 10, 20, 60, 20],
+    [0.5, 66, 33, 206, 120], [0.7, 140, 100, 255, 200], [1.0, 225, 224, 235, 255],
+  ];
+  const yzThumbnailRef = useRef<string | null>(null);
+  if (volumeData && dimensions[0] > 0 && !yzThumbnailRef.current) {
+    try {
+      const [dimX, dimY, dimZ] = dimensions;
+      const sliceX = Math.floor(dimX / 2);
+      // axis=x: w=dimY, h=dimZ, idx = row*dimY*dimX + col*dimX + sliceX
+      const cW = dimY, cH = dimZ;
+      const canvas = document.createElement('canvas');
+      canvas.width = cW;
+      canvas.height = cH;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        const imgData = ctx.createImageData(cW, cH);
+        for (let row = 0; row < cH; row++) {
+          for (let col = 0; col < cW; col++) {
+            const idx = row * dimY * dimX + col * dimX + sliceX;
+            const val = Math.max(0, Math.min(1, idx < volumeData.length ? volumeData[idx] : 0));
+            let r = 0, g = 0, b = 0, a = 0;
+            for (let i = 1; i < WATER_OFF_MAP.length; i++) {
+              if (val <= WATER_OFF_MAP[i][0]) {
+                const t = (val - WATER_OFF_MAP[i - 1][0]) / (WATER_OFF_MAP[i][0] - WATER_OFF_MAP[i - 1][0]);
+                r = WATER_OFF_MAP[i - 1][1] + t * (WATER_OFF_MAP[i][1] - WATER_OFF_MAP[i - 1][1]);
+                g = WATER_OFF_MAP[i - 1][2] + t * (WATER_OFF_MAP[i][2] - WATER_OFF_MAP[i - 1][2]);
+                b = WATER_OFF_MAP[i - 1][3] + t * (WATER_OFF_MAP[i][3] - WATER_OFF_MAP[i - 1][3]);
+                a = WATER_OFF_MAP[i - 1][4] + t * (WATER_OFF_MAP[i][4] - WATER_OFF_MAP[i - 1][4]);
+                break;
+              }
+            }
+            const pxIdx = (row * cW + col) * 4;
+            imgData.data[pxIdx] = r;
+            imgData.data[pxIdx + 1] = g;
+            imgData.data[pxIdx + 2] = b;
+            imgData.data[pxIdx + 3] = a;
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+        yzThumbnailRef.current = canvas.toDataURL('image/png');
+        // Release canvas memory — clear pixel buffer and nullify dimensions
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    } catch { /* ignore */ }
+  }
+
+  const hasMap = gpxTrack && gpxTrack.points.length > 1;
+
+  // ─── Mobile volume section renderer ──────────────────────────────────────
+  const renderMobileVolumeSection = (
+    mode: 'instrument' | 'spatial' | 'classic',
+    containerRef: React.RefObject<HTMLDivElement>,
+    title: string,
+    subtitle: string,
+    sectionIndex: number,
+  ) => {
+    const isExpanded = editingMode === mode;
+    const isTemporal = mode === 'classic' || mode === 'spatial';
+    const settings = modeSettings[mode];
+
+    return (
+      <section key={mode} style={{ marginBottom: '24px' }}>
+        {/* Title row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <h2 style={{ margin: 0, fontSize: '18px', fontWeight: 600, color: colors.text1, lineHeight: 1.1 }}>
+              <span style={{ color: colors.accent, fontSize: '0.7em', marginRight: '4px' }}>"</span>{title}<span style={{ color: colors.accent, fontSize: '0.7em', marginLeft: '4px' }}>"</span>
+            </h2>
+            <p style={{ margin: '2px 0 0', fontSize: '11px', color: colors.text3, lineHeight: 1.3 }}>{subtitle}</p>
+          </div>
+          <div style={{ width: '32px', height: '32px', minWidth: '32px', borderRadius: '50%', border: `2px solid ${colors.accent}`, color: colors.accent, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '12px', fontWeight: 600 }}>
+            {String(sectionIndex + 1).padStart(2, '0')}
+          </div>
+          <button
+            onClick={() => {
+              if (isExpanded) { startSnapBack(mode); setEditingMode(null); }
+              else { cancelSnapBack(mode); setEditingMode(mode); }
+            }}
+            style={{ width: '36px', height: '36px', minWidth: '36px', borderRadius: '50%', border: `1.5px solid ${isExpanded ? colors.accent : colors.border}`, background: isExpanded ? colors.accentMuted : colors.surface, color: isExpanded ? colors.accent : colors.text2, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'all 200ms ease' }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+          </button>
+        </div>
+
+        {/* Chromatic pills — horizontal scroll */}
+        <div style={{ display: 'flex', gap: '4px', flexWrap: 'nowrap', overflowX: 'auto', marginBottom: '8px', paddingBottom: '2px' }}>
+          {chromaticModes.map((m: ChromaticMode) => (
+            <button key={m} onClick={() => handleChromaticChange(mode, m)} style={{ padding: '4px 10px', borderRadius: '9999px', border: `1px solid ${settings.chromaticMode === m ? colors.accent : 'transparent'}`, background: settings.chromaticMode === m ? colors.accentMuted : colors.surface, color: settings.chromaticMode === m ? colors.accent : colors.text1, fontSize: '10px', fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', whiteSpace: 'nowrap', flexShrink: 0 }}>
+              {CHROMATIC_LABELS[m][lang as 'en' | 'fr'] || CHROMATIC_LABELS[m].en}
+            </button>
+          ))}
+        </div>
+
+        {/* 3D Volume viewport — square, full width */}
+        <div
+          ref={containerRef}
+          onPointerDown={() => { if (!isExpanded) handleStage1PointerDown(mode); }}
+          onPointerUp={() => { if (!isExpanded) handleStage1PointerUp(mode); }}
+          style={{
+            width: '100%',
+            height: '52vw',
+            maxHeight: '320px',
+            borderRadius: '12px',
+            overflow: 'hidden',
+            background: isExpanded ? viewportBgEditing : viewportBg,
+            cursor: 'grab',
+            border: `1.5px solid ${isExpanded ? colors.accent : colors.border}`,
+            marginBottom: '8px',
+          }}
+        />
+
+        {/* Slider + play controls — show when functional (frames, spatial scrub, or instrument) */}
+        {(mode === 'instrument' || hasFrames || hasSpatialScrub) && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+            <div style={{ flex: 1, padding: '6px 12px', background: colors.surface, borderRadius: '16px', border: `1px solid ${colors.border}`, display: 'flex', alignItems: 'center' }}>
+              <input
+                type="range"
+                min={mode === 'instrument' ? -0.75 : 0}
+                max={mode === 'instrument' ? 0.75 : totalFrames - 1}
+                step={mode === 'instrument' ? 0.01 : 1}
+                value={mode === 'instrument' ? -tracePositionZ : currentFrame}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                  if (mode === 'instrument') { handleTracePositionZ(-parseFloat(e.target.value)); }
+                  else { setPlaying(false); const v = Number(e.target.value); currentFrameRef.current = v; setCurrentFrame(v); }
+                }}
+                style={{ flex: 1, accentColor: colors.accent, cursor: 'pointer', height: '4px' }}
+              />
+            </div>
+            {(hasFrames || hasSpatialScrub) && (
+              <button
+                onClick={() => { if (currentFrame >= totalFrames - 1) { currentFrameRef.current = 0; setCurrentFrame(0); } setPlaying((p) => !p); }}
+                style={{ width: '44px', height: '44px', borderRadius: '14px', border: `1.5px solid ${colors.accent}`, background: playing ? colors.accentMuted : colors.surface, color: colors.accent, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
+              >
+                {playing ? (<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="3" width="6" height="18" rx="1.5" /><rect x="14" y="3" width="6" height="18" rx="1.5" /></svg>) : (<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: '2px' }}><path d="M6 4l15 8-15 8V4z" /></svg>)}
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Settings panel — collapsible */}
+        {isExpanded && (
+          <GlassPanel className="echos-controls-panel" style={{ padding: '10px', borderRadius: '12px', marginTop: '6px', animation: 'echos-fade-in 200ms ease' }}>
+            {calibrationOpen ? (
+              <CalibrationPanel config={calibrations[mode]} onChange={handleCalibrationChange} onClose={() => setCalibrationOpen(false)} saved={calibrationSaved} saveLabel={calibrationSaveLabel} />
+            ) : (
+              <SettingsControls settings={modeSettings[mode]} cameraPreset={modeCamera[mode]} autoThreshold={autoThreshold} showGhostSlider={mode === 'spatial' || mode === 'classic'} showBeamToggle={mode === 'instrument'} showSpeedSlider={false} playSpeed={playSpeed} chromaticModes={chromaticModes} lang={lang} t={t} onUpdateSetting={updateSetting} onCameraPreset={handleCameraPreset} onAutoThreshold={handleAutoThreshold} onPlaySpeed={setPlaySpeed} />
+            )}
+          </GlassPanel>
+        )}
+      </section>
+    );
+  };
+
+  // ─── MOBILE LAYOUT ─────────────────────────────────────────────────────────
+  if (isMobile) {
+    const mobileSections: Array<{ mode: 'instrument' | 'spatial' | 'classic'; ref: typeof containerARef; title: string; subtitle: string }> = [];
+    if (showC) mobileSections.push({ mode: 'classic', ref: containerCRef, title: t('v2.vol.cone' as TranslationKey), subtitle: t('v2.vol.coneDesc' as TranslationKey) });
+    mobileSections.push({ mode: 'instrument', ref: containerARef, title: t('v2.vol.trace' as TranslationKey), subtitle: t('v2.vol.traceDesc' as TranslationKey) });
+    if (showB) mobileSections.push({ mode: 'spatial', ref: containerBRef, title: t('v2.vol.block' as TranslationKey), subtitle: t('v2.vol.blockDesc' as TranslationKey) });
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', maxWidth: '100vw', overflow: 'hidden', padding: '0 var(--page-gutter)' }}>
+        {/* Title */}
+        <div style={{ paddingTop: '16px', marginBottom: '12px' }}>
+          <h1 style={{ margin: 0, color: colors.text1, fontSize: '20px', fontWeight: 600, marginBottom: '2px' }}>
+            {t('v2.viewer.title')}
+          </h1>
+          <p style={{ margin: 0, color: colors.text2, fontSize: '12px', lineHeight: 1.4 }}>
+            {t('v2.viewer.desc')}
+          </p>
+        </div>
+
+        {/* File info — compact card */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: '12px', padding: '10px 12px', marginBottom: '12px', overflow: 'hidden' }}>
+          <div style={{ width: '56px', height: '56px', borderRadius: '8px', overflow: 'hidden', flexShrink: 0, background: viewportBg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            {yzThumbnailRef.current ? (
+              <img src={yzThumbnailRef.current} alt="YZ" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+            ) : (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={colors.text3} strokeWidth="1.5"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></svg>
+            )}
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: '13px', fontWeight: 600, color: colors.text1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {videoFileName || 'Session'}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 12px', fontSize: '11px', color: colors.text2, marginTop: '2px' }}>
+              {videoDurationS != null && videoDurationS > 0 && <span>{videoDurationS.toFixed(1)}s</span>}
+              {dimensions && <span>{dimensions[0]}×{dimensions[1]}×{dimensions[2]}</span>}
+              {gpxTrack && <span>{gpxTrack.totalDistanceM.toFixed(0)}m</span>}
+              {frames && frames.length > 0 && <span>{frames.length} frames</span>}
+            </div>
+          </div>
+        </div>
+
+        {/* Map — compact */}
+        {hasMap && (
+          <div style={{ borderRadius: '12px', overflow: 'hidden', border: `1px solid ${colors.border}`, height: '140px', marginBottom: '16px', position: 'relative' }}>
+            <GpsMap points={gpxTrack!.points} theme={theme} />
+          </div>
+        )}
+
+        {/* Volume sections — stacked */}
+        {mobileSections.map((s, i) => renderMobileVolumeSection(s.mode, s.ref, s.title, s.subtitle, i))}
+
+        {/* Credits */}
+        <div style={{
+          textAlign: 'center',
+          padding: '24px 16px',
+          color: colors.text3,
+          fontSize: '11px',
+          lineHeight: 1.6,
+        }}>
+        </div>
+
+        {/* Bottom actions */}
+        {(onReconfigure || onNewScan || onClose || onPublish) && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', paddingBottom: '16px', paddingTop: '8px', alignItems: 'center' }}>
+            {publishError && (
+              <span style={{ fontSize: '11px', color: colors.error, textAlign: 'center' }}>
+                {publishError}
+              </span>
+            )}
+            {onClose && (
+              <button
+                className="echos-action-btn"
+                onClick={onClose}
+                style={{ padding: '10px 24px', borderRadius: '9999px', border: `1.5px solid ${colors.border}`, background: 'transparent', color: colors.text2, fontSize: '13px', fontWeight: 600, fontFamily: 'inherit', cursor: 'pointer', width: '100%' }}
+              >
+                {t('common.close' as TranslationKey)}
+              </button>
+            )}
+            {onPublish && !published && (
+              <Button variant="primary" size="lg" disabled={publishing} onClick={onPublish} style={{ width: '100%' }}>
+                {publishing ? 'Publication...' : t('common.poster' as TranslationKey)}
+              </Button>
+            )}
+            {published && (
+              <span style={{ padding: '10px 24px', borderRadius: '9999px', background: 'rgba(34, 197, 94, 0.15)', color: '#22c55e', fontSize: '13px', fontWeight: 600 }}>
+                Session publiée
+              </span>
+            )}
+            {onReconfigure && (
+              <button className="echos-action-btn" onClick={onReconfigure} style={{ padding: '10px 24px', borderRadius: '9999px', border: `1.5px solid ${colors.accent}`, background: 'transparent', color: colors.accent, fontSize: '13px', fontWeight: 600, fontFamily: 'inherit', cursor: 'pointer', width: '100%' }}>
+                {t('v2.viewer.reconfigure')}
+              </button>
+            )}
+            {onNewScan && (
+              <Button variant="primary" size="lg" onClick={onNewScan}>
+                {t('v2.viewer.newScan')}
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ─── DESKTOP LAYOUT (unchanged) ────────────────────────────────────────────
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', padding: '0 var(--content-gutter)' }}>
+      {/* ── Title — always at top, full width ───────────── */}
+      <div style={{ paddingTop: 'clamp(32px, 5vh, 64px)', marginBottom: '40px' }}>
+        <h1 style={{
+          margin: 0,
+          color: colors.text1,
+          fontSize: 'clamp(24px, 3vw, 36px)',
+          fontWeight: 600,
+          marginBottom: '2px',
+        }}>
+          {t('v2.viewer.title')}
+        </h1>
+        <p style={{
+          margin: 0,
+          color: colors.text2,
+          fontSize: '15px',
+          lineHeight: 1.6,
+          maxWidth: '700px',
+        }}>
+          {t('v2.viewer.desc')}
+        </p>
+      </div>
+
+      {/* ── File info (3 cols) + Map (1 col) — same 4-col grid as volume sections ─── */}
+      <div className="echos-quad-grid" style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(4, 1fr)',
+        gap: '24px',
+        marginBottom: '64px',
+      }}>
+        {/* File identification — 3 columns */}
+        <div style={{
+          gridColumn: '1 / 4',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '16px',
+          background: colors.surface,
+          border: `1px solid ${colors.border}`,
+          borderRadius: '16px',
+          padding: '16px 20px',
+          overflow: 'hidden',
+        }}>
+          {/* Thumbnail from YZ slice — rotated 90deg counter-clockwise */}
+          <div style={{
+            width: '120px',
+            height: '120px',
+            borderRadius: '12px',
+            overflow: 'hidden',
+            flexShrink: 0,
+            background: viewportBg,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
+            {yzThumbnailRef.current ? (
+              <img
+                src={yzThumbnailRef.current}
+                alt="YZ slice"
+                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+              />
+            ) : (
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke={colors.text3} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <circle cx="8.5" cy="8.5" r="1.5" />
+                <polyline points="21 15 16 10 5 21" />
+              </svg>
+            )}
+          </div>
+          {/* File details */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: '15px', fontWeight: 600, color: colors.text1, marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {videoFileName || 'Session'}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px 24px', fontSize: '13px', color: colors.text2 }}>
+              {videoDurationS != null && videoDurationS > 0 && (
+                <span>{videoDurationS.toFixed(1)}s</span>
+              )}
+              {dimensions && (
+                <span>{dimensions[0]}×{dimensions[1]}×{dimensions[2]}</span>
+              )}
+              {gpxTrack && (
+                <span>{gpxTrack.totalDistanceM.toFixed(0)}m</span>
+              )}
+              {gpxFileName && (
+                <span style={{ color: colors.text3 }}>{gpxFileName}</span>
+              )}
+              {frames && frames.length > 0 && (
+                <span>{frames.length} frames</span>
+              )}
+              {gpxTrack && gpxTrack.points.length > 0 && (
+                <span>
+                  {gpxTrack.points[0].lat.toFixed(4)}°N, {gpxTrack.points[0].lon.toFixed(4)}°E
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Map — 1 column, aligned to file info height */}
+        <div style={{
+          gridColumn: '4',
+          borderRadius: '16px',
+          overflow: 'hidden',
+          border: `1px solid ${colors.border}`,
+          position: 'relative',
+        }}>
+          <GpsMap points={hasMap ? gpxTrack.points : undefined} theme={theme} />
+          {!hasMap && (
+            <div style={{
+              position: 'absolute',
+              bottom: '8px',
+              left: '8px',
+              right: '8px',
+              background: theme === 'light' ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.7)',
+              borderRadius: '8px',
+              padding: '6px 10px',
+              fontSize: '10px',
+              color: colors.text3,
+              lineHeight: 1.3,
+              textAlign: 'center',
+            }}>
+              {t('v2.map.gpxHint' as TranslationKey)}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Volume sections — 4-column grid, alternating layout ──── */}
+      {(() => {
+        const sections: Array<{ mode: 'instrument' | 'spatial' | 'classic'; ref: typeof containerARef; title: string; subtitle: string }> = [];
+        if (showC) sections.push({ mode: 'classic', ref: containerCRef, title: t('v2.vol.cone' as TranslationKey), subtitle: t('v2.vol.coneDesc' as TranslationKey) });
+        sections.push({ mode: 'instrument', ref: containerARef, title: t('v2.vol.trace' as TranslationKey), subtitle: t('v2.vol.traceDesc' as TranslationKey) });
+        if (showB) sections.push({ mode: 'spatial', ref: containerBRef, title: t('v2.vol.block' as TranslationKey), subtitle: t('v2.vol.blockDesc' as TranslationKey) });
+        return sections.map((s, i) => renderVolumeSection(s.mode, s.ref, s.title, s.subtitle, i));
+      })()}
+
+      {/* Orthogonal slice panels */}
+      {sliceVolumeData && sliceVolumeData.length > 0 && (
+        <div style={{ marginBottom: '32px' }}>
+          <SlicePanel ref={slicePanelRef} volumeData={sliceVolumeData} dimensions={sliceDimensions} />
+        </div>
+      )}
+
+      {/* Export panel */}
+      <ExportPanel
+        volumeData={sliceVolumeData}
+        dimensions={sliceDimensions}
+        extent={extent}
+        onCaptureScreenshot={handleCaptureScreenshot}
+        onCaptureAllPng={handleCaptureAllPng}
+        onExportHTML={() => {
+          if (!volumeData) return;
+          downloadStandaloneHTML({
+            sessionName: videoFileName || 'session',
+            instrument: { data: volumeData, dimensions, extent },
+            spatial: spatialData && spatialDimensions && spatialExtent
+              ? { data: spatialData, dimensions: spatialDimensions, extent: spatialExtent }
+              : null,
+            classic: classicData && classicDimensions && classicExtent
+              ? { data: classicData, dimensions: classicDimensions, extent: classicExtent }
+              : null,
+            gpxPoints: gpxTrack?.points,
+            durationS: videoDurationS,
+            frameCount: frames?.length,
+          });
+        }}
+      />
+
+      {/* Credits */}
+      <div style={{
+        textAlign: 'center',
+        padding: '32px 24px',
+        color: colors.text3,
+        fontSize: '13px',
+        lineHeight: 1.7,
+      }}>
+      </div>
+
+      {/* Bottom action buttons */}
+      <div style={{ height: '32px', flexShrink: 0 }} />
+      {(onReconfigure || onNewScan || onClose || onPublish) && (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '16px', flexShrink: 0, paddingBottom: '24px', flexWrap: 'wrap' }}>
+          {publishError && (
+            <span style={{ fontSize: '12px', color: colors.error, maxWidth: '400px', textAlign: 'center' }}>
+              {publishError}
+            </span>
+          )}
+          {onClose && (
+            <button
+              className="echos-action-btn"
+              onClick={onClose}
+              style={{
+                padding: '12px 32px', borderRadius: '9999px',
+                border: `1.5px solid ${colors.border}`,
+                background: 'transparent', color: colors.text2,
+                fontSize: '15px', fontWeight: 600, fontFamily: 'inherit',
+                cursor: 'pointer', transition: 'all 150ms ease',
+              }}
+            >
+              {t('common.close' as TranslationKey)}
+            </button>
+          )}
+          {onPublish && !published && (
+            <Button
+              variant="primary"
+              size="lg"
+              disabled={publishing}
+              onClick={onPublish}
+            >
+              {publishing ? 'Publication...' : t('common.poster' as TranslationKey)}
+            </Button>
+          )}
+          {published && (
+            <span style={{
+              padding: '12px 32px',
+              borderRadius: '9999px',
+              background: 'rgba(34, 197, 94, 0.15)',
+              color: '#22c55e',
+              fontSize: '15px',
+              fontWeight: 600,
+            }}>
+              Session publiée
+            </span>
+          )}
+          {onReconfigure && (
+            <button
+              className="echos-action-btn"
+              onClick={onReconfigure}
+              style={{
+                padding: '12px 32px', borderRadius: '9999px',
+                border: `1.5px solid ${colors.accent}`,
+                background: 'transparent', color: colors.accent,
+                fontSize: '15px', fontWeight: 600, fontFamily: 'inherit',
+                cursor: 'pointer', transition: 'all 150ms ease',
+              }}
+            >
+              {t('v2.viewer.reconfigure')}
+            </button>
+          )}
+          {onNewScan && (
+            <Button variant="primary" size="lg" onClick={onNewScan}>
+              {t('v2.viewer.newScan')}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
